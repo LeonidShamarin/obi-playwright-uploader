@@ -118,35 +118,78 @@ async def upload_xlsx_to_obi(
         log.info("Clicked Kategorie wählen: %s", cat_clicked)
         await page.wait_for_timeout(2500)
         screenshots.append(await _shot(page, "04_category_dropdown_open"))
-        # Click перший radio у dialog + Confirm
+
+        # Click LABEL/row containing the first radio — VTEX renders radios as
+        # custom UI, тому input.click() не реєструється у React. Натомість
+        # клікаємо контейнер (label/listrow), який слухає user input event.
+        try:
+            # Спочатку пробуємо через Playwright locator з force=True (обхід
+            # перевірки видимості, бо input може бути hidden під custom UI).
+            radio = app_frame.locator('input[type="radio"]').first
+            await radio.click(force=True, timeout=5000)
+            log.info("Radio clicked via Playwright locator (force=True)")
+        except Exception as e:
+            log.warning("Radio click via locator failed: %s — fallback to JS label-click", e)
+
+        # Fallback/duplicate: клік по батьківському label (емулює user click)
         picked = await app_frame.evaluate(
             """
             () => {
-                // Шукаємо dialog/role=dialog або клас з 'modal'
                 const dialog = document.querySelector('[role="dialog"], .vtex-modal, [class*="modal" i]');
                 const scope = dialog || document;
-                // Перший radio
                 const radio = scope.querySelector('input[type="radio"]');
                 if (!radio) return {error: 'no_radio'};
+                // VTEX wrapу радіо у label або div-row. Клік по label
+                // правильно тригерить React-handlers.
+                let target = radio.closest('label');
+                if (!target) {
+                    // fallback — найближчий клікабельний контейнер
+                    target = radio.closest('[class*="row" i], [class*="item" i], div');
+                }
+                if (target) {
+                    target.click();
+                    return {clicked_via: target.tagName, class: target.className?.toString().slice(0,80)};
+                }
                 radio.click();
-                return {radio_value: radio.value, name: radio.name};
+                return {clicked_via: 'INPUT'};
             }
             """
         )
-        log.info("Category radio clicked: %s", picked)
-        await page.wait_for_timeout(800)
-        # Click Confirm
+        log.info("Category label/radio clicked: %s", picked)
+
+        # Чекаємо поки Confirm стане enabled (до 6 сек)
+        for tick in range(12):
+            await page.wait_for_timeout(500)
+            confirm_state = await app_frame.evaluate(
+                """
+                () => {
+                    const btns = [...document.querySelectorAll('button')];
+                    const found = btns.find(b => /^\\s*confirm\\s*$|bestätigen|^\\s*ok\\s*$/i.test(b.innerText || ''));
+                    if (!found) return {found: false};
+                    return {found: true, disabled: found.disabled || found.getAttribute('aria-disabled') === 'true'};
+                }
+                """
+            )
+            if confirm_state.get("found") and not confirm_state.get("disabled"):
+                break
+            log.info("Waiting for Confirm to enable (tick %d): %s", tick, confirm_state)
+
         confirmed = await app_frame.evaluate(
             """
             () => {
                 const btns = [...document.querySelectorAll('button')];
-                const found = btns.find(b => /confirm|bestätigen|ok\\b/i.test(b.innerText || ''));
-                if (found && !found.disabled) { found.click(); return {clicked: found.innerText.trim()}; }
-                return {error: 'no_confirm', buttons: btns.map(b => (b.innerText || '').trim()).filter(Boolean).slice(0,20)};
+                const found = btns.find(b => /^\\s*confirm\\s*$|bestätigen|^\\s*ok\\s*$/i.test(b.innerText || ''));
+                if (!found) return {error: 'no_confirm', buttons: btns.map(b => (b.innerText || '').trim()).filter(Boolean).slice(0,20)};
+                if (found.disabled) return {error: 'disabled', text: found.innerText.trim()};
+                found.click();
+                return {clicked: found.innerText.trim()};
             }
             """
         )
         log.info("Confirm clicked: %s", confirmed)
+        if confirmed.get("error"):
+            screenshots.append(await _shot(page, "ERR_confirm_disabled"))
+            raise RuntimeError(f"Could not confirm category: {confirmed}")
         await page.wait_for_timeout(2000)
         screenshots.append(await _shot(page, "05_category_picked"))
     else:
@@ -429,18 +472,24 @@ async def _frame_pick_dropdown_option(frame: Frame, value: str):
 async def _frame_add_sku_image_mapping(frame: Frame, col_name: str):
     """Розкриває SKU Images dropdown і додає col_name."""
     try:
-        # Спершу клік на поле "SKU Images"
+        # Спершу клік на поле "SKU Images" — лояльний пошук label-а
         opened = await frame.evaluate(
             """
             () => {
-                const labels = [...document.querySelectorAll('*')]
-                    .filter(el => (el.innerText || '').trim() === 'SKU Images');
-                for (const el of labels) {
-                    // Шукаємо найближчий dropdown trigger
-                    let target = el.closest('div,section,fieldset')?.querySelector('[role="combobox"], button, input');
+                const ALLOWED = ['DIV','SPAN','LABEL','BUTTON','H2','H3','H4','LI','P'];
+                const candidates = [...document.querySelectorAll('div, span, label, button, h2, h3, h4, li, p')]
+                    .filter(el => {
+                        const t = (el.innerText || '').trim();
+                        return /^sku images?$/i.test(t) || t === 'SKU Images';
+                    });
+                for (const el of candidates) {
+                    // Шукаємо ближній dropdown trigger (combobox/button/input у тому ж блоці)
+                    const block = el.closest('div,section,fieldset,tr,li');
+                    let target = block?.querySelector('[role="combobox"], [role="button"], button, input[type="text"]');
                     if (!target) target = el;
+                    target.scrollIntoView({block: 'center'});
                     target.click();
-                    return {clicked: el.tagName};
+                    return {clicked: el.tagName, text: (el.innerText || '').trim().slice(0,40)};
                 }
                 return null;
             }
