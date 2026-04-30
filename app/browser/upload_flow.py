@@ -16,7 +16,8 @@ from app.settings import settings
 
 log = logging.getLogger("browser.upload_flow")
 
-PRODUKTIMPORT_URL = "https://hajus679.myvtex.com/admin/products/Produktimport"
+ADMIN_BASE_URL = "https://hajus679.myvtex.com/admin"
+# Правильний URL невідомий — використовуємо sidebar navigation замість прямого goto.
 SKU_IMAGE_COLUMNS_TO_MAP = [f"SKU Images {i}" for i in range(3, 11)]  # 3..10
 STATUS_TERMINAL = {"completed", "failed"}
 STATUS_POLL_INTERVAL = 10  # seconds
@@ -39,14 +40,56 @@ async def upload_xlsx_to_obi(
     screenshots = []
     category = category or settings.obi_default_category
 
-    log.info("Navigating to %s", PRODUKTIMPORT_URL)
-    await page.goto(PRODUKTIMPORT_URL, wait_until="domcontentloaded")
-    # VTEX admin SPA робить багато XHR-ів — чекаємо networkidle
+    log.info("Navigating to admin home %s", ADMIN_BASE_URL)
+    await page.goto(ADMIN_BASE_URL, wait_until="domcontentloaded")
     try:
         await page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
-        log.warning("networkidle timeout (20s) — продовжуємо все одно")
-    await page.wait_for_timeout(2000)  # ще дамо React rerender
+        log.warning("networkidle timeout — продовжуємо")
+    await page.wait_for_timeout(2000)
+    screenshots.append(await _shot(page, "00_admin_home"))
+
+    # Sidebar має посилання "Import von Produkten" (DE) — клікаємо його
+    log.info("Looking for sidebar link 'Import von Produkten'...")
+    sidebar_link = None
+    sidebar_candidates = [
+        ('text="Import von Produkten"', lambda: page.get_by_text(re.compile(r"Import\s+von\s+Produkten", re.I))),
+        ('role:link "Import von Produkten"', lambda: page.get_by_role("link", name=re.compile(r"Import\s+von\s+Produkten", re.I))),
+        ('text="Produktimport"',         lambda: page.get_by_text(re.compile(r"Produktimport", re.I))),
+        ('text="Product Import"',        lambda: page.get_by_text(re.compile(r"Product\s+Import", re.I))),
+    ]
+    elapsed = 0.0
+    while elapsed < 25.0:
+        for label, factory in sidebar_candidates:
+            loc = factory()
+            try:
+                count = await loc.count()
+                if count:
+                    first = loc.first
+                    if await first.is_visible(timeout=500):
+                        log.info("Sidebar link found via %s after %.1fs", label, elapsed)
+                        sidebar_link = first
+                        break
+            except Exception:
+                continue
+        if sidebar_link is not None:
+            break
+        await asyncio.sleep(2)
+        elapsed += 2
+
+    if sidebar_link is None:
+        screenshots.append(await _shot(page, "ERR_sidebar_link_not_found"))
+        raise RuntimeError(
+            f"Sidebar link 'Import von Produkten' not found on admin home. URL: {page.url}"
+        )
+
+    await sidebar_link.click()
+    try:
+        await page.wait_for_load_state("networkidle", timeout=20000)
+    except Exception:
+        log.warning("networkidle after sidebar click timeout — продовжуємо")
+    await page.wait_for_timeout(2000)
+    log.info("After sidebar click, URL=%s", page.url)
     screenshots.append(await _shot(page, "00_produktimport_loaded"))
 
     # Polling-search для Neuimport button до 25s
