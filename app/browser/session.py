@@ -1,13 +1,14 @@
 """
 Менеджер Playwright-сесії: тримає persistent storage_state.json,
-fallback на повний логін з TOTP, якщо сесія протухла.
+fallback на повний логін, якщо сесія протухла.
 
-VTEX Admin login може мати кілька форм:
-  1) одна сторінка email + password
-  2) email -> Continue -> новий екран з password
-  3) magic-link (email-only) — тоді password взагалі нема
-  4) iframe (VTEX ID embed)
+VTEX Admin login (для нашого акаунту info@hajus-ag.com) — passwordless email-code:
+  1. Email → Weiter
+  2. VTEX надсилає 6-значний код на email
+  3. OTP-сервер (88.198.203.52:9510) читає цей код і віддає через REST
+  4. Code → Weiter → admin home
 """
+import asyncio
 import logging
 import re
 from contextlib import asynccontextmanager
@@ -25,6 +26,7 @@ log = logging.getLogger("browser.session")
 
 ADMIN_HOME_PATTERN = re.compile(r"/admin/(catalog|products|Site|home)", re.IGNORECASE)
 LOGIN_PATTERN = re.compile(r"/admin-login/|/_v/segment/admin-login", re.IGNORECASE)
+OTP_RETRIEVE_DELAY_SEC = 6  # дамо VTEX час доставити email до OTP-сервера
 
 
 @asynccontextmanager
@@ -81,7 +83,7 @@ async def _ensure_logged_in(page: Page, context: BrowserContext) -> None:
     target = settings.vtex_login_url
     log.info("Navigating to %s", target)
     await page.goto(target, wait_until="domcontentloaded")
-    await page.wait_for_timeout(2000)  # дати React зрендериться
+    await page.wait_for_timeout(2000)
 
     if ADMIN_HOME_PATTERN.search(page.url):
         log.info("Session is alive (URL: %s)", page.url)
@@ -92,45 +94,17 @@ async def _ensure_logged_in(page: Page, context: BrowserContext) -> None:
     await _do_login(page, context)
 
 
-async def _find_email_input(page: Page):
-    """Спробувати кілька селекторів. Повертає Locator або None."""
-    candidates = [
-        'input[type="email"]',
-        'input[name*="email" i]',
-        'input[id*="email" i]',
-        'input[placeholder*="email" i]',
-        'input[autocomplete="username"]',
-        'input[autocomplete="email"]',
-    ]
-    for sel in candidates:
-        loc = page.locator(sel).first
-        try:
-            if await loc.count() and await loc.is_visible(timeout=2000):
-                log.info("Email input found via: %s", sel)
-                return loc
-        except Exception:
-            continue
-    return None
-
-
-async def _find_password_input(page: Page, timeout_ms: int = 30000):
-    """Чекає до timeout_ms на видимий password input. Повертає Locator або None."""
-    candidates = [
-        'input[type="password"]',
-        'input[name*="password" i]',
-        'input[id*="password" i]',
-        'input[autocomplete="current-password"]',
-    ]
-    log.info("Waiting up to %dms for password input via %d selectors", timeout_ms, len(candidates))
+async def _find_input(page: Page, candidates: list[str], label: str, timeout_ms: int = 30000):
+    """Polling-пошук видимого input серед заданих селекторів."""
+    log.info("Waiting up to %dms for %s input", timeout_ms, label)
     deadline = timeout_ms / 1000.0
-    import asyncio
     elapsed = 0.0
     while elapsed < deadline:
         for sel in candidates:
             loc = page.locator(sel).first
             try:
                 if await loc.count() and await loc.is_visible(timeout=500):
-                    log.info("Password input found via: %s (after %.1fs)", sel, elapsed)
+                    log.info("%s input found via: %s (after %.1fs)", label, sel, elapsed)
                     return loc
             except Exception:
                 continue
@@ -140,109 +114,119 @@ async def _find_password_input(page: Page, timeout_ms: int = 30000):
 
 
 async def _click_continue(page: Page) -> bool:
-    """Клікає 'Continue' / 'Weiter' / 'Next'. Повертає True якщо клікнули."""
-    candidates_role = [r"weiter", r"next", r"continue", r"weitermachen", r"fortfahren"]
-    pat = re.compile("|".join(candidates_role), re.IGNORECASE)
+    pat = re.compile(r"weiter|next|continue|fortfahren", re.IGNORECASE)
     btn = page.get_by_role("button", name=pat)
     if await btn.count():
         try:
             await btn.first.click()
-            log.info("Clicked continue/next button")
+            log.info("Clicked WEITER/Next button")
             return True
         except Exception:
-            log.exception("Continue click failed")
-    # Інший варіант — submit-кнопка біля email
+            log.exception("Click WEITER failed")
     submit = page.locator('button[type="submit"]').first
     if await submit.count():
         try:
             await submit.click()
-            log.info("Clicked submit button")
+            log.info("Clicked submit button (no role match)")
             return True
         except Exception:
-            log.exception("Submit click failed")
+            log.exception("Click submit failed")
     return False
 
 
 async def _do_login(page: Page, context: BrowserContext) -> None:
     user = settings.vtex_login_user
-    pwd = settings.vtex_login_password
 
     # 1) Email step
-    email_input = await _find_email_input(page)
+    email_input = await _find_input(
+        page,
+        candidates=[
+            'input[type="email"]',
+            'input[name*="email" i]',
+            'input[id*="email" i]',
+            'input[placeholder*="email" i]',
+            'input[autocomplete="username"]',
+            'input[autocomplete="email"]',
+        ],
+        label="email",
+        timeout_ms=15000,
+    )
     if not email_input:
-        await _shot(page, "02_email_input_NOT_FOUND")
-        raise RuntimeError(
-            f"Email input not found on login page (URL: {page.url}). "
-            "Check screenshots/login_*_email_input_NOT_FOUND.png"
-        )
+        await _shot(page, "ERR_email_input_NOT_FOUND")
+        raise RuntimeError(f"Email input not found on login page (URL: {page.url})")
     await email_input.fill(user)
     await _shot(page, "02_email_filled")
 
-    # 2) Continue / Next (якщо є)
-    clicked = await _click_continue(page)
-    if clicked:
-        await page.wait_for_load_state("domcontentloaded", timeout=15000)
-        await page.wait_for_timeout(1500)
+    # 2) Weiter
+    if not await _click_continue(page):
+        await _shot(page, "ERR_no_continue_button")
+        raise RuntimeError("Continue/Weiter button not found")
+
+    await page.wait_for_load_state("domcontentloaded", timeout=15000)
+    await page.wait_for_timeout(1500)
     await _shot(page, "03_after_email_continue")
 
-    # 3) Password step (з ширшими селекторами і довшим таймаутом)
-    pwd_input = await _find_password_input(page, timeout_ms=30000)
-    if not pwd_input:
-        await _shot(page, "04_password_NOT_FOUND")
-        raise RuntimeError(
-            f"Password input not found after email step (URL: {page.url}). "
-            "Можливо це email-magic-link flow. Перевір скріншоти "
-            "screenshots/login_*_password_NOT_FOUND.png"
-        )
-    await pwd_input.fill(pwd)
-    await _shot(page, "05_password_filled")
-
-    # 4) Submit
-    submit = page.get_by_role(
-        "button", name=re.compile(r"log\s*in|anmelden|sign\s*in|einloggen", re.I),
+    # 3) Очікуємо появу поля Code (VTEX надіслав email-magic-code)
+    code_input = await _find_input(
+        page,
+        candidates=[
+            'input[autocomplete="one-time-code"]',
+            'input[name*="code" i]',
+            'input[id*="code" i]',
+            'input[placeholder*="code" i]',
+            # fallback — VTEX може використати generic text input на цій сторінці
+            'input[type="text"]:not([type="email"])',
+            'input[type="tel"]',
+            'input[inputmode="numeric"]',
+        ],
+        label="email-code",
+        timeout_ms=20000,
     )
-    if await submit.count():
-        await submit.first.click()
-    else:
-        await pwd_input.press("Enter")
+    if not code_input:
+        await _shot(page, "ERR_code_input_NOT_FOUND")
+        raise RuntimeError(
+            f"Code input not found after email continue (URL: {page.url}). "
+            "Очікуємо input для email-code, але VTEX зробив щось інше."
+        )
+
+    # 4) Дамо OTP-серверу час прийняти email і витягти код
+    log.info("Waiting %ds for OTP server to receive email", OTP_RETRIEVE_DELAY_SEC)
+    await asyncio.sleep(OTP_RETRIEVE_DELAY_SEC)
+
+    # 5) Тягнемо код з OTP-сервера (з кількома retry якщо ще не дійшов)
+    code = None
+    for attempt in range(1, 5):
+        try:
+            code = get_vtex_otp()
+            log.info("OTP-server returned code (length=%d) on attempt %d", len(code), attempt)
+            if code and len(code) >= 4:
+                break
+        except Exception:
+            log.exception("OTP fetch attempt %d failed", attempt)
+        await asyncio.sleep(5)
+
+    if not code:
+        await _shot(page, "ERR_no_otp_code")
+        raise RuntimeError("Failed to retrieve OTP code from OTP server")
+
+    await code_input.fill(code)
+    await _shot(page, "04_code_filled")
+
+    # 6) Submit
+    if not await _click_continue(page):
+        # fallback на Enter в полі
+        try:
+            await code_input.press("Enter")
+        except Exception:
+            log.exception("Could not submit code")
 
     await page.wait_for_load_state("networkidle", timeout=30000)
-    await _shot(page, "06_after_password_submit")
+    await _shot(page, "05_after_code_submit")
 
-    # 5) OTP — якщо запитується
-    if await _looks_like_otp_prompt(page):
-        log.info("OTP prompt detected — fetching code from OTP server")
-        code = get_vtex_otp()
-        await _fill_otp(page, code)
-        await page.wait_for_load_state("networkidle", timeout=30000)
-        await _shot(page, "07_after_otp")
-
-    # 6) Перевірка успіху
+    # 7) Перевірка успіху
     if LOGIN_PATTERN.search(page.url):
-        await _shot(page, "08_login_failed_final")
+        await _shot(page, "ERR_still_on_login_page")
         raise RuntimeError(f"Login failed — still on {page.url}")
 
     log.info("Login successful (URL: %s)", page.url)
-    await _shot(page, "08_login_success")
-
-
-async def _looks_like_otp_prompt(page: Page) -> bool:
-    try:
-        otp_field = page.locator(
-            'input[name*="otp" i], input[name*="code" i], input[autocomplete="one-time-code"]'
-        ).first
-        return await otp_field.count() > 0
-    except Exception:
-        return False
-
-
-async def _fill_otp(page: Page, code: str) -> None:
-    field = page.locator(
-        'input[name*="otp" i], input[name*="code" i], input[autocomplete="one-time-code"]'
-    ).first
-    await field.fill(code)
-    submit = page.get_by_role("button", name=re.compile(r"verify|bestätigen|submit|continue", re.I))
-    if await submit.count():
-        await submit.first.click()
-    else:
-        await field.press("Enter")
+    await _shot(page, "06_login_success")
