@@ -1,294 +1,181 @@
 """
-Upload-flow VTEX seller cabinet:
-  Produkte → Produktimport → +Neuimport →
-  Jobname → Kategorie wählen → upload xlsx → Mapping (SKU Images 3..10) →
-  Nächster → polling status → if errors → download Fehlerbericht.
+Upload-flow VTEX seller cabinet — iframe-aware версія.
+
+VTEX seller-product-importer рендериться у IO iframe (`<iframe src=".../admin/app">`).
+Всі content actions (forms, buttons, dropdowns) — всередині цього frame.
+Тому використовуємо `page.frames` + JS-evaluate для більшості кроків.
+
+Послідовність:
+  1. goto /admin/products → click sidebar "Import von Produkten" (main frame)
+  2. Знайти app frame (url містить /admin/app) → JS-click "Neuer Import"
+  3. У формі new-import: fill Jobname, pick Kategorie, upload xlsx
+  4. Mapping: додати SKU Images 3..10
+  5. Polling status, download Fehlerbericht якщо помилки.
 """
 import asyncio
+import base64
 import logging
 import re
 from datetime import datetime
 from pathlib import Path
 
-from playwright.async_api import Page, TimeoutError as PlaywrightTimeout
+from playwright.async_api import Page, Frame, TimeoutError as PlaywrightTimeout
 
 from app.settings import settings
 
 log = logging.getLogger("browser.upload_flow")
 
 ADMIN_BASE_URL = "https://hajus679.myvtex.com/admin"
-# Правильний URL невідомий — використовуємо sidebar navigation замість прямого goto.
-SKU_IMAGE_COLUMNS_TO_MAP = [f"SKU Images {i}" for i in range(3, 11)]  # 3..10
-STATUS_TERMINAL = {"completed", "failed"}
-STATUS_POLL_INTERVAL = 10  # seconds
-STATUS_POLL_MAX_TRIES = 90  # 15 хвилин на імпорт
+APP_FRAME_MARKER = "/admin/app"  # iframe src
+SKU_IMAGE_COLUMNS_TO_MAP = [f"SKU Images {i}" for i in range(3, 11)]
+STATUS_POLL_INTERVAL = 10
+STATUS_POLL_MAX_TRIES = 90  # 15 хв
 
 
 async def upload_xlsx_to_obi(
     page: Page, xlsx_bytes: bytes, jobname: str, category: str | None = None,
 ) -> dict:
-    """
-    Виконує повний upload-flow і повертає JSON-звіт:
-      {
-        "status": "completed" | "failed" | "timeout",
-        "jobname": str,
-        "totals": {imported, failed, skipped, total},
-        "fehlerbericht_xlsx_b64": str | None,
-        "screenshots": [path1, path2, ...]
-      }
-    """
-    screenshots = []
+    screenshots: list[str] = []
     category = category or settings.obi_default_category
 
-    # Залишаємось на /admin/products де sidebar Produkte вже розгорнутий
-    # після успішного login redirect — там пункт "Import von Produkten" видимий.
-    products_url = f"{ADMIN_BASE_URL}/products"
-    log.info("Navigating to %s (Produkte sidebar розгорнуто там)", products_url)
-    await page.goto(products_url, wait_until="domcontentloaded")
+    # ── 1. Navigate to products + sidebar click ─────────────────────────────
+    await page.goto(f"{ADMIN_BASE_URL}/products", wait_until="domcontentloaded")
     try:
         await page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
-        log.warning("networkidle timeout — продовжуємо")
+        log.warning("networkidle timeout on /admin/products")
     await page.wait_for_timeout(2000)
     screenshots.append(await _shot(page, "00_admin_products"))
 
-    # Sidebar має посилання "Import von Produkten" (DE) — клікаємо його
-    log.info("Looking for sidebar link 'Import von Produkten'...")
-    sidebar_link = None
-    sidebar_candidates = [
-        ('text="Import von Produkten"', lambda: page.get_by_text(re.compile(r"Import\s+von\s+Produkten", re.I))),
-        ('role:link "Import von Produkten"', lambda: page.get_by_role("link", name=re.compile(r"Import\s+von\s+Produkten", re.I))),
-        ('text="Produktimport"',         lambda: page.get_by_text(re.compile(r"Produktimport", re.I))),
-        ('text="Product Import"',        lambda: page.get_by_text(re.compile(r"Product\s+Import", re.I))),
-    ]
-    elapsed = 0.0
-    while elapsed < 25.0:
-        for label, factory in sidebar_candidates:
-            loc = factory()
-            try:
-                count = await loc.count()
-                if count:
-                    first = loc.first
-                    if await first.is_visible(timeout=500):
-                        log.info("Sidebar link found via %s after %.1fs", label, elapsed)
-                        sidebar_link = first
-                        break
-            except Exception:
-                continue
-        if sidebar_link is not None:
-            break
-        await asyncio.sleep(2)
-        elapsed += 2
-
-    if sidebar_link is None:
-        screenshots.append(await _shot(page, "ERR_sidebar_link_not_found"))
-        raise RuntimeError(
-            f"Sidebar link 'Import von Produkten' not found on admin home. URL: {page.url}"
-        )
+    sidebar_link = await _find_in_main(
+        page,
+        candidates=[
+            lambda: page.get_by_text(re.compile(r"Import\s+von\s+Produkten", re.I)),
+            lambda: page.get_by_role("link", name=re.compile(r"Import\s+von\s+Produkten", re.I)),
+        ],
+        label="sidebar 'Import von Produkten'",
+        timeout_s=15,
+    )
+    if not sidebar_link:
+        screenshots.append(await _shot(page, "ERR_sidebar_not_found"))
+        raise RuntimeError("Sidebar link 'Import von Produkten' not found")
 
     await sidebar_link.click()
     try:
         await page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
-        log.warning("networkidle after sidebar click timeout — продовжуємо")
+        log.warning("networkidle timeout after sidebar click")
     await page.wait_for_timeout(2000)
-    log.info("After sidebar click, URL=%s", page.url)
-    screenshots.append(await _shot(page, "00_produktimport_loaded"))
+    log.info("After sidebar click URL=%s", page.url)
+    screenshots.append(await _shot(page, "01_product_imports_list"))
 
-    # Polling-search для "Neuer Import" / "Neuimport" / "New Import" button до 25s
-    new_btn = None
-    new_import_re = re.compile(r"Neuer\s+Import|Neuimport|New\s+Import", re.I)
-    candidate_factories = [
-        # CSS-селектори з :has-text (найнадійніше для VTEX UI)
-        ('css button:has-text("Neuer Import")', lambda: page.locator('button:has-text("Neuer Import")')),
-        ('css a:has-text("Neuer Import")',      lambda: page.locator('a:has-text("Neuer Import")')),
-        ('css [role=button]:has-text("Neuer Import")', lambda: page.locator('[role="button"]:has-text("Neuer Import")')),
-        ('css button:has-text("Neuer")',        lambda: page.locator('button:has-text("Neuer")')),
-        # Fallback на role-based
-        ('role:button name=re Neuer Import', lambda: page.get_by_role("button", name=new_import_re)),
-        ('role:link name=re Neuer Import',   lambda: page.get_by_role("link",   name=new_import_re)),
-        ('text Neuer Import',                lambda: page.get_by_text(new_import_re)),
-    ]
-    log.info("Polling до 25s для Neuer-Import button...")
-    elapsed = 0.0
-    while elapsed < 25.0:
-        for label, factory in candidate_factories:
-            loc = factory()
-            try:
-                count = await loc.count()
-                if count:
-                    first = loc.first
-                    if await first.is_visible(timeout=500):
-                        log.info("Neuimport found via %s after %.1fs (matches=%d)", label, elapsed, count)
-                        new_btn = first
-                        break
-            except Exception:
-                continue
-        if new_btn is not None:
-            break
-        await asyncio.sleep(2)
-        elapsed += 2
+    # ── 2. Find app frame ────────────────────────────────────────────────────
+    app_frame = await _wait_for_app_frame(page, timeout_s=20)
+    log.info("App frame ready: %s", app_frame.url)
 
-    if new_btn is None:
-        # Спочатку — чи є iframe(s) на сторінці? VTEX часто використовує legacy iframes.
-        iframes_info = await page.evaluate("""
-            () => Array.from(document.querySelectorAll('iframe')).map(f => ({
-                src: f.src, id: f.id, name: f.name, title: f.title,
-                width: f.clientWidth, height: f.clientHeight,
-            }))
-        """)
-        log.info("iframes on page: %s", iframes_info)
-
-        # Якщо є iframe — пробуємо знайти кнопку всередині кожного frame
-        if iframes_info:
-            for frame in page.frames:
-                if frame == page.main_frame:
-                    continue
-                log.info("Checking frame: url=%s name=%r", frame.url, frame.name)
-                try:
-                    in_frame = await frame.evaluate("""
-                        () => {
-                            const targets = [...document.querySelectorAll('button, a, [role="button"]')];
-                            const found = targets.find(el =>
-                                (el.innerText || '').toLowerCase().includes('neuer import')
-                                || (el.getAttribute('aria-label') || '').toLowerCase().includes('neuer import')
-                            );
-                            if (found) {
-                                found.scrollIntoView({block: 'center'});
-                                found.click();
-                                return {tag: found.tagName, text: (found.innerText || '').trim().slice(0, 60)};
-                            }
-                            return null;
-                        }
-                    """)
-                    if in_frame:
-                        log.info("Clicked Neuer Import inside frame: %s", in_frame)
-                        try:
-                            await page.wait_for_load_state("networkidle", timeout=20000)
-                        except Exception:
-                            pass
-                        screenshots.append(await _shot(page, "01_neuimport_open"))
-                        new_btn = "JS_CLICKED_VIA_FRAME"  # позначаємо, що клік стався
-                        break
-                except Exception:
-                    log.exception("Frame click attempt failed")
-
-        # Diagnostic: подивимось всі кнопки і посилання на сторінці
-        try:
-            elements_info = await page.evaluate("""
-                () => {
-                    const collect = (sel) => Array.from(document.querySelectorAll(sel))
-                        .map(el => ({
-                            tag: el.tagName,
-                            text: (el.innerText || '').trim().slice(0, 60),
-                            aria: el.getAttribute('aria-label') || '',
-                            role: el.getAttribute('role') || '',
-                        }))
-                        .filter(x => x.text.length > 0 || x.aria.length > 0);
-                    return {
-                        buttons: collect('button'),
-                        links: collect('a'),
-                        role_buttons: collect('[role="button"]'),
-                    };
-                }
-            """)
-            log.info("Page elements debug: %s", elements_info)
-        except Exception:
-            log.exception("Failed to enumerate page elements")
-
-        # Спроба JS-click через innerText match (на main frame)
-        if new_btn is None:
-            log.info("Trying JS click via innerText match (main frame)...")
-        clicked_via_js = None if new_btn is not None else await page.evaluate("""
-            () => {
-                const targets = [...document.querySelectorAll('button, a, [role="button"]')];
-                const found = targets.find(el =>
-                    (el.innerText || '').toLowerCase().includes('neuer import')
-                    || (el.getAttribute('aria-label') || '').toLowerCase().includes('neuer import')
-                );
-                if (found) {
-                    found.scrollIntoView({block: 'center'});
-                    found.click();
-                    return {tag: found.tagName, text: (found.innerText || '').trim().slice(0, 60)};
-                }
-                return null;
-            }
-        """)
-        if clicked_via_js:
-            log.info("JS click succeeded on element: %s", clicked_via_js)
-            await page.wait_for_load_state("networkidle", timeout=20000)
-            screenshots.append(await _shot(page, "01_neuimport_open"))
-        else:
-            screenshots.append(await _shot(page, "ERR_neuimport_not_found"))
-            raise RuntimeError(
-                f"Neuer Import button not found (URL: {page.url}). "
-                "Перевір screenshots/ERR_neuimport_not_found.png + Coolify logs."
-            )
-    else:
-        try:
-            await new_btn.click(timeout=15000)
-        except Exception:
-            screenshots.append(await _shot(page, "ERR_neuimport_click_failed"))
-            raise
+    # ── 3. Click "Neuer Import" inside app frame ─────────────────────────────
+    clicked = await _frame_click_by_text(app_frame, "neuer import")
+    if not clicked:
+        screenshots.append(await _shot(page, "ERR_neuimport_in_frame"))
+        raise RuntimeError("Could not click 'Neuer Import' in app frame")
+    log.info("Clicked 'Neuer Import': %s", clicked)
+    await page.wait_for_timeout(3000)
+    try:
         await page.wait_for_load_state("networkidle", timeout=20000)
-        screenshots.append(await _shot(page, "01_neuimport_open"))
+    except Exception:
+        pass
+    # frame-ref може застаріти після navigation — оновлюємо
+    app_frame = await _wait_for_app_frame(page, timeout_s=20)
+    screenshots.append(await _shot(page, "02_neuimport_form"))
 
-    # Jobname
-    jobname_input = page.locator('input[name*="job" i], input[id*="job" i]').first
-    if await jobname_input.count():
-        await jobname_input.fill(jobname)
+    # ── 4. Fill Jobname ─────────────────────────────────────────────────────
+    await _frame_set_input_value(app_frame, "jobname", jobname,
+                                 placeholder_pat=r"Jobname|Importauftrag|job")
+    screenshots.append(await _shot(page, "03_jobname_filled"))
 
-    # Kategorie wählen
-    cat_btn = page.get_by_role("button", name=re.compile(r"Kategorie\s*wählen", re.I))
-    if await cat_btn.count():
-        await cat_btn.first.click()
-        # Шукаємо категорію в dropdown / search
-        await asyncio.sleep(1)
-        search = page.locator('input[type="search"], input[placeholder*="Suchen" i]').first
-        if await search.count():
-            await search.fill(category)
-            await asyncio.sleep(1)
-        # Вибираємо першу пропозицію
-        first_option = page.locator('[role="option"], li[data-value]').first
-        if await first_option.count():
-            await first_option.click()
-        screenshots.append(await _shot(page, "02_category_picked"))
+    # ── 5. Kategorie wählen ─────────────────────────────────────────────────
+    cat_clicked = await _frame_click_by_text(app_frame, "kategorie wählen")
+    if not cat_clicked:
+        cat_clicked = await _frame_click_by_text(app_frame, "kategorie")
+    if cat_clicked:
+        log.info("Clicked Kategorie wählen: %s", cat_clicked)
+        await page.wait_for_timeout(2000)
+        screenshots.append(await _shot(page, "04_category_dropdown_open"))
+        # Search для category, click first
+        await _frame_pick_dropdown_option(app_frame, category)
+        screenshots.append(await _shot(page, "05_category_picked"))
+    else:
+        log.warning("Kategorie wählen button not found — пробуємо без вибору")
+        screenshots.append(await _shot(page, "WARN_no_kategorie_btn"))
 
-    # Datei hochladen
-    file_input = page.locator('input[type="file"]').first
+    # ── 6. Upload xlsx ──────────────────────────────────────────────────────
+    file_input = await _frame_find_file_input(app_frame, timeout_s=15)
+    if not file_input:
+        screenshots.append(await _shot(page, "ERR_no_file_input"))
+        raise RuntimeError("File input not found in form")
     await file_input.set_input_files(
-        files=[{"name": f"{jobname}.xlsx", "mimeType":
-               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                "buffer": xlsx_bytes}]
+        files=[{
+            "name": f"{jobname}.xlsx",
+            "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "buffer": xlsx_bytes,
+        }]
     )
-    await page.wait_for_load_state("networkidle")
-    screenshots.append(await _shot(page, "03_file_uploaded"))
+    log.info("File uploaded (%d bytes)", len(xlsx_bytes))
+    await page.wait_for_timeout(3000)
+    screenshots.append(await _shot(page, "06_file_uploaded"))
 
-    # Nächster Schritt → Mapping
-    next_btn = page.get_by_role("button", name=re.compile(r"Nächster|Next|Weiter", re.I))
-    await next_btn.first.click()
-    await page.wait_for_load_state("networkidle")
-    screenshots.append(await _shot(page, "04_mapping_open"))
+    # ── 7. Click "Nächster Schritt" → mapping page ─────────────────────────
+    next_clicked = await _frame_click_by_text(app_frame, "nächster")
+    if not next_clicked:
+        next_clicked = await _frame_click_by_text(app_frame, "next")
+    if not next_clicked:
+        screenshots.append(await _shot(page, "ERR_no_next_after_upload"))
+        raise RuntimeError("Could not click Nächster after file upload")
+    log.info("Clicked Nächster: %s", next_clicked)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=20000)
+    except Exception:
+        pass
+    await page.wait_for_timeout(2000)
+    app_frame = await _wait_for_app_frame(page, timeout_s=10)
+    screenshots.append(await _shot(page, "07_mapping_page"))
 
-    # Mapping: розкрити Product Content і додати SKU Images 3..10
-    await _expand_product_content(page)
+    # ── 8. Mapping: add SKU Images 3..10 ────────────────────────────────────
+    log.info("Mapping: expand Product Content + add %d image columns", len(SKU_IMAGE_COLUMNS_TO_MAP))
+    # Розгортаємо Product Content
+    await _frame_click_by_text(app_frame, "product content")
+    await page.wait_for_timeout(1000)
+    screenshots.append(await _shot(page, "08_product_content_open"))
+
     for col in SKU_IMAGE_COLUMNS_TO_MAP:
-        await _add_image_mapping(page, col)
-    screenshots.append(await _shot(page, "05_mapping_done"))
+        await _frame_add_sku_image_mapping(app_frame, col)
+    screenshots.append(await _shot(page, "09_mapping_done"))
 
-    # Next → запуск імпорту
-    next_btn2 = page.get_by_role("button", name=re.compile(r"Nächster|Next|Weiter", re.I))
-    await next_btn2.first.click()
-    await page.wait_for_load_state("networkidle")
-    screenshots.append(await _shot(page, "06_import_started"))
+    # ── 9. Click Next → start import ───────────────────────────────────────
+    next2 = await _frame_click_by_text(app_frame, "nächster")
+    if not next2:
+        next2 = await _frame_click_by_text(app_frame, "next")
+    if next2:
+        log.info("Clicked Nächster (start import): %s", next2)
+    else:
+        log.warning("Next button after mapping not found — продовжуємо до polling")
+    try:
+        await page.wait_for_load_state("networkidle", timeout=20000)
+    except Exception:
+        pass
+    await page.wait_for_timeout(3000)
+    app_frame = await _wait_for_app_frame(page, timeout_s=10)
+    screenshots.append(await _shot(page, "10_import_started"))
 
-    # Polling статусу
-    final_status, totals = await _poll_status(page)
-    screenshots.append(await _shot(page, "07_final_status"))
+    # ── 10. Polling status ──────────────────────────────────────────────────
+    final_status, totals = await _poll_status(page, app_frame)
+    screenshots.append(await _shot(page, "11_final_status"))
 
+    # ── 11. Fehlerbericht ──────────────────────────────────────────────────
     fehler_b64 = None
-    if final_status == "failed" or (totals and totals.get("failed", 0) > 0):
-        fehler_b64 = await _download_fehlerbericht(page)
+    if final_status in ("failed",) or (totals and totals.get("failed", 0) > 0):
+        fehler_b64 = await _download_fehlerbericht(page, app_frame)
+        screenshots.append(await _shot(page, "12_fehlerbericht_downloaded"))
 
     return {
         "status": final_status,
@@ -300,114 +187,282 @@ async def upload_xlsx_to_obi(
     }
 
 
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
 async def _shot(page: Page, label: str) -> str:
-    name = f"{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{label}.png"
+    name = f"flow_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{label}.png"
     path = Path(settings.screenshot_dir) / name
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         await page.screenshot(path=str(path), full_page=True)
     except Exception:
-        log.exception("Failed to take screenshot %s", name)
+        log.exception("Screenshot %s failed", name)
     return str(path)
 
 
-async def _expand_product_content(page: Page) -> None:
-    """Розкриває секцію Product Content на mapping-екрані."""
-    section = page.get_by_text("Product Content", exact=False).first
+async def _find_in_main(page: Page, candidates: list, label: str, timeout_s: int = 15):
+    elapsed = 0
+    while elapsed < timeout_s:
+        for factory in candidates:
+            loc = factory()
+            try:
+                if await loc.count() and await loc.first.is_visible(timeout=500):
+                    return loc.first
+            except Exception:
+                continue
+        await asyncio.sleep(1)
+        elapsed += 1
+    return None
+
+
+async def _wait_for_app_frame(page: Page, timeout_s: int = 20) -> Frame:
+    elapsed = 0
+    while elapsed < timeout_s:
+        for frame in page.frames:
+            if frame == page.main_frame:
+                continue
+            if APP_FRAME_MARKER in (frame.url or ""):
+                return frame
+        await asyncio.sleep(1)
+        elapsed += 1
+    raise RuntimeError(f"App iframe (containing {APP_FRAME_MARKER}) not found")
+
+
+async def _frame_click_by_text(frame: Frame, needle: str) -> dict | None:
+    """JS click на button/a/[role=button] чий innerText/aria-label містить needle (case-insensitive)."""
     try:
-        await section.click()
-        await asyncio.sleep(0.5)
+        return await frame.evaluate(
+            """
+            (needle) => {
+                const lc = needle.toLowerCase();
+                const targets = [...document.querySelectorAll('button, a, [role="button"], [type="submit"]')];
+                const found = targets.find(el =>
+                    (el.innerText || '').toLowerCase().includes(lc)
+                    || (el.getAttribute('aria-label') || '').toLowerCase().includes(lc)
+                );
+                if (found) {
+                    found.scrollIntoView({block: 'center'});
+                    found.click();
+                    return {tag: found.tagName, text: (el => (el.innerText || '').trim().slice(0, 80))(found)};
+                }
+                return null;
+            }
+            """,
+            needle,
+        )
     except Exception:
-        log.warning("Could not click Product Content section")
+        log.exception("Frame JS click failed for %r", needle)
+        return None
 
 
-async def _add_image_mapping(page: Page, col_name: str) -> None:
-    """Знаходить SKU Images dropdown, додає вказаний column."""
-    sku_images_field = page.locator('text="SKU Images"').first
+async def _frame_set_input_value(frame: Frame, label: str, value: str, placeholder_pat: str = ""):
+    """Шукає input/textarea для введення (за placeholder/name/label) і виставляє value."""
     try:
-        # Клік по полю dropdown щоб відкрити
-        await sku_images_field.click()
+        result = await frame.evaluate(
+            """
+            ([labelLc, value, placeholderPat]) => {
+                const inputs = [...document.querySelectorAll('input:not([type=hidden]):not([type=file]), textarea')];
+                const re = placeholderPat ? new RegExp(placeholderPat, 'i') : null;
+                const found = inputs.find(el => {
+                    const ph = el.getAttribute('placeholder') || '';
+                    const name = el.getAttribute('name') || '';
+                    const id = el.id || '';
+                    if (re && (re.test(ph) || re.test(name) || re.test(id))) return true;
+                    return false;
+                }) || inputs[0];  // fallback: перший input
+                if (found) {
+                    found.focus();
+                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(found, value);
+                    found.dispatchEvent(new Event('input', {bubbles: true}));
+                    found.dispatchEvent(new Event('change', {bubbles: true}));
+                    return {placeholder: found.getAttribute('placeholder'), name: found.getAttribute('name')};
+                }
+                return null;
+            }
+            """,
+            [label.lower(), value, placeholder_pat],
+        )
+        log.info("Input set %r: %s", label, result)
     except Exception:
-        log.warning("SKU Images field not found")
-        return
+        log.exception("Failed to set input %r", label)
 
-    # Шукаємо поле пошуку у відкритому dropdown
-    search = page.locator('input[type="search"], input[placeholder*="search" i]').first
-    if await search.count():
-        await search.fill(col_name)
+
+async def _frame_find_file_input(frame: Frame, timeout_s: int = 15):
+    """Знаходить ElementHandle на input[type=file]. Чекає до timeout_s."""
+    elapsed = 0
+    while elapsed < timeout_s:
+        try:
+            handle = await frame.query_selector('input[type="file"]')
+            if handle:
+                return handle
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+        elapsed += 1
+    return None
+
+
+async def _frame_pick_dropdown_option(frame: Frame, value: str):
+    """Після відкриття dropdown — шукає поле пошуку, набирає value, клікає першу опцію."""
+    try:
+        await frame.evaluate(
+            """
+            (value) => {
+                const search = document.querySelector('input[type="search"], input[placeholder*="uchen" i], input[placeholder*="earch" i]');
+                if (search) {
+                    search.focus();
+                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(search, value);
+                    search.dispatchEvent(new Event('input', {bubbles: true}));
+                }
+            }
+            """,
+            value,
+        )
+        await asyncio.sleep(1.5)
+        # Click first option
+        await frame.evaluate(
+            """
+            () => {
+                const opts = [...document.querySelectorAll('[role="option"], li[data-value], button[data-value]')];
+                if (opts.length) {
+                    opts[0].click();
+                }
+            }
+            """
+        )
+    except Exception:
+        log.exception("dropdown pick failed for %r", value)
+
+
+async def _frame_add_sku_image_mapping(frame: Frame, col_name: str):
+    """Розкриває SKU Images dropdown і додає col_name."""
+    try:
+        # Спершу клік на поле "SKU Images"
+        opened = await frame.evaluate(
+            """
+            () => {
+                const labels = [...document.querySelectorAll('*')]
+                    .filter(el => (el.innerText || '').trim() === 'SKU Images');
+                for (const el of labels) {
+                    // Шукаємо найближчий dropdown trigger
+                    let target = el.closest('div,section,fieldset')?.querySelector('[role="combobox"], button, input');
+                    if (!target) target = el;
+                    target.click();
+                    return {clicked: el.tagName};
+                }
+                return null;
+            }
+            """
+        )
+        if not opened:
+            log.warning("SKU Images dropdown not opened")
+            return
         await asyncio.sleep(0.7)
+        # Search col_name + click matching option
+        await frame.evaluate(
+            """
+            (col) => {
+                const search = document.querySelector('input[type="search"], input[role="combobox"]');
+                if (search) {
+                    search.focus();
+                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(search, col);
+                    search.dispatchEvent(new Event('input', {bubbles: true}));
+                }
+            }
+            """,
+            col_name,
+        )
+        await asyncio.sleep(0.7)
+        await frame.evaluate(
+            """
+            (col) => {
+                const candidates = [...document.querySelectorAll('[role="option"], li, button')];
+                const found = candidates.find(el => (el.innerText || '').trim() === col);
+                if (found) found.click();
+                return found ? {clicked: col} : null;
+            }
+            """,
+            col_name,
+        )
+        await asyncio.sleep(0.5)
+        log.info("Added SKU Images mapping: %s", col_name)
+    except Exception:
+        log.exception("SKU mapping failed for %s", col_name)
 
-    option = page.locator(f'[role="option"]:has-text("{col_name}")').first
-    if await option.count():
-        await option.click()
-        log.info("Mapped column %s", col_name)
-    else:
-        log.warning("Column %s not found in mapping dropdown", col_name)
-    await asyncio.sleep(0.5)
 
-
-async def _poll_status(page: Page) -> tuple[str, dict | None]:
-    """
-    Чекає, поки статус імпорту стане completed/failed.
-    Повертає (status, totals_dict).
-    """
+async def _poll_status(page: Page, frame: Frame) -> tuple[str, dict | None]:
+    """Очікує completed/failed. Повертає (status, totals)."""
     for attempt in range(STATUS_POLL_MAX_TRIES):
         try:
-            status_text = (
-                await page.locator(
-                    'text=/preflight|new|completed|failed/i'
-                ).first.text_content(timeout=2000)
-            )
-        except PlaywrightTimeout:
-            status_text = ""
-        s = (status_text or "").strip().lower()
-        log.info("Import status (attempt %d/%d): %r", attempt + 1, STATUS_POLL_MAX_TRIES, s)
-
-        if "completed" in s:
-            return "completed", await _read_totals(page)
-        if "failed" in s:
-            return "failed", await _read_totals(page)
+            text = await frame.evaluate("() => document.body.innerText.toLowerCase()")
+            if "completed" in text:
+                log.info("Import status: completed (attempt %d)", attempt + 1)
+                return "completed", await _read_totals(frame)
+            if "failed" in text or "fehlgeschlagen" in text:
+                log.info("Import status: failed (attempt %d)", attempt + 1)
+                return "failed", await _read_totals(frame)
+            log.info("Import status pending (attempt %d/%d)", attempt + 1, STATUS_POLL_MAX_TRIES)
+        except Exception:
+            log.exception("Poll iteration failed")
         await asyncio.sleep(STATUS_POLL_INTERVAL)
         try:
             await page.reload(wait_until="domcontentloaded")
+            await page.wait_for_timeout(2000)
+            frame = await _wait_for_app_frame(page, timeout_s=10)
         except Exception:
             log.exception("Reload during polling failed")
     return "timeout", None
 
 
-async def _read_totals(page: Page) -> dict:
-    """Витягає Gesamtanzahl/Importierte/Fehlgeschlagene/Übersprungene з UI."""
-    out = {}
-    for label, key in (
-        ("Gesamtanzahl", "total"),
-        ("Importierte", "imported"),
-        ("Fehlgeschlagene", "failed"),
-        ("Übersprungene", "skipped"),
-    ):
-        try:
-            el = page.locator(f'text=/{label}/i').first
-            if await el.count():
-                surrounding = await el.evaluate("el => el.closest('div').innerText")
-                m = re.search(r"\d+", surrounding or "")
-                if m:
-                    out[key] = int(m.group(0))
-        except Exception:
-            log.exception("Failed to read %s", label)
-    return out
+async def _read_totals(frame: Frame) -> dict:
+    try:
+        return await frame.evaluate(
+            """
+            () => {
+                const text = document.body.innerText;
+                const out = {};
+                for (const [label, key] of [
+                    ['Gesamtanzahl', 'total'],
+                    ['Importierte', 'imported'],
+                    ['Fehlgeschlagene', 'failed'],
+                    ['Übersprungene', 'skipped'],
+                ]) {
+                    const m = text.match(new RegExp(label + '[^0-9]*(\\\\d+)'));
+                    if (m) out[key] = parseInt(m[1], 10);
+                }
+                return out;
+            }
+            """
+        )
+    except Exception:
+        return {}
 
 
-async def _download_fehlerbericht(page: Page) -> str | None:
-    """Кліком на Fehlerbericht XLSX/CSV завантажує файл і повертає base64."""
-    import base64
-
-    btn = page.get_by_role("link", name=re.compile(r"Fehlerbericht.*XLSX|Fehlerbericht", re.I))
-    if not await btn.count():
-        log.warning("Fehlerbericht link not found")
+async def _download_fehlerbericht(page: Page, frame: Frame) -> str | None:
+    try:
+        # Знаходимо link Fehlerbericht (XLSX) і кліком стартуємо download
+        async with page.expect_download(timeout=30000) as dl_info:
+            clicked = await frame.evaluate(
+                """
+                () => {
+                    const links = [...document.querySelectorAll('a, button')];
+                    const found = links.find(el => /fehlerbericht.*xlsx|fehlerbericht/i.test(el.innerText || ''));
+                    if (found) { found.click(); return true; }
+                    return false;
+                }
+                """
+            )
+            if not clicked:
+                log.warning("Fehlerbericht link not found")
+                return None
+        download = await dl_info.value
+        save_path = Path(settings.download_dir) / download.suggested_filename
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        await download.save_as(str(save_path))
+        return base64.b64encode(save_path.read_bytes()).decode("ascii")
+    except Exception:
+        log.exception("Fehlerbericht download failed")
         return None
-    async with page.expect_download() as dl_info:
-        await btn.first.click()
-    download = await dl_info.value
-    save_path = Path(settings.download_dir) / download.suggested_filename
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    await download.save_as(str(save_path))
-    return base64.b64encode(save_path.read_bytes()).decode("ascii")
