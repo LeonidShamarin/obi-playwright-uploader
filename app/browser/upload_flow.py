@@ -283,14 +283,21 @@ async def upload_xlsx_to_obi(
         await _frame_add_sku_image_mapping(app_frame, col)
     screenshots.append(await _shot(page, "09_mapping_done"))
 
-    # ── 9. Click Next → start import ───────────────────────────────────────
-    next2 = await _frame_click_by_text(app_frame, "nächster")
+    # ── 9. Click Weiter → start import ─────────────────────────────────────
+    # Користувач підтвердив: після мапінгу натискається синя "Weiter"
+    # вгорі сторінки (не "Nächster"). Спершу пробуємо її, далі fallbacks.
+    next2 = await _frame_click_by_text(app_frame, "weiter")
+    if not next2:
+        next2 = await _frame_click_by_text(app_frame, "nächster")
     if not next2:
         next2 = await _frame_click_by_text(app_frame, "next")
+    if not next2:
+        next2 = await _frame_click_by_text(app_frame, "importieren")
     if next2:
-        log.info("Clicked Nächster (start import): %s", next2)
+        log.info("Clicked Weiter (start import): %s", next2)
     else:
         log.warning("Next button after mapping not found — продовжуємо до polling")
+        screenshots.append(await _shot(page, "WARN_no_next_after_mapping"))
     try:
         await page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
