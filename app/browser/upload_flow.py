@@ -656,35 +656,51 @@ async def _frame_add_sku_images_multiselect(frame: Frame, page: Page, col_names:
         if opened.get("error"):
             log.warning("Failed to re-open dropdown for %s: %s", col, opened)
             continue
-        await page.wait_for_timeout(600)
+        await page.wait_for_timeout(800)
 
-        # 2. Click option — exact text-match
-        result = await frame.evaluate(
-            """
-            (col) => {
-                const options = [...document.querySelectorAll('[role="option"], li, [data-value]')];
-                let found = options.find(el => (el.innerText || '').trim() === col);
-                if (!found) {
-                    // Lenient: trim + match start (handle hidden chevron suffix)
-                    found = options.find(el => {
-                        const t = (el.innerText || '').trim();
-                        return t === col || t.startsWith(col);
-                    });
-                }
-                if (!found) {
-                    return {error: 'no_option', col, sample_options: options.slice(0,15).map(o => (o.innerText||'').trim().slice(0,40))};
-                }
-                found.scrollIntoView({block: 'center'});
-                found.click();
-                return {clicked: col, tag: found.tagName, role: found.getAttribute('role')};
-            }
-            """,
-            col,
-        )
-        if result.get("error"):
-            log.warning("Option not found for %s: %s", col, result)
-        else:
-            log.info("Added SKU Images mapping: %s", col)
+        # 2. Click option через Playwright locator — auto-wait для visibility,
+        #    і textContent-style match (через get_by_role("option", name=...))
+        clicked = False
+        try:
+            opt = frame.get_by_role("option", name=col, exact=True)
+            count = await opt.count()
+            for idx in range(min(count, 5)):
+                cand = opt.nth(idx)
+                try:
+                    if not await cand.is_visible(timeout=300):
+                        continue
+                    await cand.scroll_into_view_if_needed(timeout=2000)
+                    await cand.click(timeout=3000)
+                    clicked = True
+                    log.info("Added SKU Images mapping: %s (role=option, idx=%d)", col, idx)
+                    break
+                except Exception:
+                    continue
+        except Exception as e:
+            log.warning("get_by_role(option, %r) raised: %s", col, e)
+
+        # Fallback: through page.get_by_text (any element exact text)
+        if not clicked:
+            try:
+                opt2 = frame.get_by_text(col, exact=True)
+                count2 = await opt2.count()
+                for idx in range(min(count2, 5)):
+                    cand2 = opt2.nth(idx)
+                    try:
+                        if not await cand2.is_visible(timeout=300):
+                            continue
+                        await cand2.scroll_into_view_if_needed(timeout=2000)
+                        await cand2.click(timeout=3000)
+                        clicked = True
+                        log.info("Added SKU Images mapping: %s (get_by_text, idx=%d)", col, idx)
+                        break
+                    except Exception:
+                        continue
+            except Exception as e:
+                log.warning("get_by_text(%r) raised: %s", col, e)
+
+        if not clicked:
+            log.warning("Option %r not clickable у dropdown", col)
         await page.wait_for_timeout(500)
 
     # Закриваємо останній dropdown (ESC) щоб не блокувати Weiter-клік
