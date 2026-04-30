@@ -40,14 +40,17 @@ async def upload_xlsx_to_obi(
     screenshots = []
     category = category or settings.obi_default_category
 
-    log.info("Navigating to admin home %s", ADMIN_BASE_URL)
-    await page.goto(ADMIN_BASE_URL, wait_until="domcontentloaded")
+    # Залишаємось на /admin/products де sidebar Produkte вже розгорнутий
+    # після успішного login redirect — там пункт "Import von Produkten" видимий.
+    products_url = f"{ADMIN_BASE_URL}/products"
+    log.info("Navigating to %s (Produkte sidebar розгорнуто там)", products_url)
+    await page.goto(products_url, wait_until="domcontentloaded")
     try:
         await page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
         log.warning("networkidle timeout — продовжуємо")
     await page.wait_for_timeout(2000)
-    screenshots.append(await _shot(page, "00_admin_home"))
+    screenshots.append(await _shot(page, "00_admin_products"))
 
     # Sidebar має посилання "Import von Produkten" (DE) — клікаємо його
     log.info("Looking for sidebar link 'Import von Produkten'...")
