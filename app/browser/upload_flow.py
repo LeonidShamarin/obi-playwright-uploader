@@ -41,36 +41,47 @@ async def upload_xlsx_to_obi(
 
     log.info("Navigating to %s", PRODUKTIMPORT_URL)
     await page.goto(PRODUKTIMPORT_URL, wait_until="domcontentloaded")
-    # Дамо React/SPA дорендеритись
-    await page.wait_for_timeout(3000)
+    # VTEX admin SPA робить багато XHR-ів — чекаємо networkidle
+    try:
+        await page.wait_for_load_state("networkidle", timeout=20000)
+    except Exception:
+        log.warning("networkidle timeout (20s) — продовжуємо все одно")
+    await page.wait_for_timeout(2000)  # ще дамо React rerender
     screenshots.append(await _shot(page, "00_produktimport_loaded"))
 
-    # Шукаємо кнопку +Neuimport кількома способами (роль кнопки/посилання, ширші селектори)
+    # Polling-search для Neuimport button до 25s
     new_btn = None
-    candidates = [
-        ('role:button name="+Neuimport"', lambda: page.get_by_role("button", name=re.compile(r"\+\s*Neuimport", re.I))),
-        ('role:button name="Neuimport"',  lambda: page.get_by_role("button", name=re.compile(r"Neuimport", re.I))),
-        ('role:button name="New import"', lambda: page.get_by_role("button", name=re.compile(r"new\s*import", re.I))),
-        ('role:link name="Neuimport"',    lambda: page.get_by_role("link",   name=re.compile(r"Neuimport", re.I))),
-        ('text=+Neuimport',                lambda: page.get_by_text(re.compile(r"\+\s*Neuimport", re.I))),
-        ('text=Neuimport',                 lambda: page.get_by_text(re.compile(r"Neuimport", re.I))),
+    candidate_factories = [
+        ('role:button name~="Neuimport"', lambda: page.get_by_role("button", name=re.compile(r"Neuimport", re.I))),
+        ('role:button name~="new import"', lambda: page.get_by_role("button", name=re.compile(r"new\s*import", re.I))),
+        ('role:link name~="Neuimport"',   lambda: page.get_by_role("link",   name=re.compile(r"Neuimport", re.I))),
+        ('text=Neuimport',                lambda: page.get_by_text(re.compile(r"Neuimport", re.I))),
     ]
-    for label, factory in candidates:
-        loc = factory()
-        try:
-            count = await loc.count()
-            if count:
-                log.info("Neuimport candidate %r matched %d elements", label, count)
-                new_btn = loc.first
-                break
-        except Exception as exc:
-            log.warning("Neuimport candidate %r failed: %s", label, exc)
+    log.info("Polling до 25s для Neuimport button...")
+    elapsed = 0.0
+    while elapsed < 25.0:
+        for label, factory in candidate_factories:
+            loc = factory()
+            try:
+                count = await loc.count()
+                if count:
+                    first = loc.first
+                    if await first.is_visible(timeout=500):
+                        log.info("Neuimport found via %s after %.1fs (matches=%d)", label, elapsed, count)
+                        new_btn = first
+                        break
+            except Exception:
+                continue
+        if new_btn is not None:
+            break
+        await asyncio.sleep(2)
+        elapsed += 2
 
     if new_btn is None:
         screenshots.append(await _shot(page, "ERR_neuimport_not_found"))
         raise RuntimeError(
-            f"+Neuimport button not found on Produktimport page (URL: {page.url}). "
-            "Перевір screenshots/00_produktimport_loaded.png і ERR_neuimport_not_found.png"
+            f"+Neuimport button not found on Produktimport page after 25s polling "
+            f"(URL: {page.url}). Перевір screenshots."
         )
 
     try:
@@ -79,7 +90,7 @@ async def upload_xlsx_to_obi(
         screenshots.append(await _shot(page, "ERR_neuimport_click_failed"))
         raise
 
-    await page.wait_for_load_state("networkidle")
+    await page.wait_for_load_state("networkidle", timeout=20000)
     screenshots.append(await _shot(page, "01_neuimport_open"))
 
     # Jobname
