@@ -83,13 +83,29 @@ async def _ensure_logged_in(page: Page, context: BrowserContext) -> None:
     target = settings.vtex_login_url
     log.info("Navigating to %s", target)
     await page.goto(target, wait_until="domcontentloaded")
-    await page.wait_for_timeout(2000)
 
+    # Polling URL до 15s — даємо VTEX SSO flow завершити редіректи.
+    # `domcontentloaded` спрацьовує до завершення JS-редіректу,
+    # тому треба активно опитувати page.url.
+    elapsed = 0.0
+    last_url = page.url
+    while elapsed < 15.0:
+        url = page.url
+        if url != last_url:
+            log.info("URL changed during polling: %s -> %s", last_url, url)
+            last_url = url
+        if ADMIN_HOME_PATTERN.search(url):
+            log.info("Session is alive (URL: %s)", url)
+            return
+        await asyncio.sleep(1)
+        elapsed += 1
+
+    # Фінальна перевірка
     if ADMIN_HOME_PATTERN.search(page.url):
-        log.info("Session is alive (URL: %s)", page.url)
+        log.info("Session is alive after polling (URL: %s)", page.url)
         return
 
-    log.info("Login required (URL: %s)", page.url)
+    log.info("Login required after %ss polling (URL: %s)", elapsed, page.url)
     await _shot(page, "01_login_page")
     await _do_login(page, context)
 
