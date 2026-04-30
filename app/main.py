@@ -34,6 +34,13 @@ class UploadRequest(BaseModel):
     ref_ids: list[str] = Field(..., description="Список Product Ref ID для імпорту")
     category: str | None = Field(None, description="Кат. для OBI (default з settings)")
     jobname: str | None = Field(None, description="Кастомний jobname (default — дата)")
+    gsheets_access_token: str | None = Field(
+        None,
+        description=(
+            "Опційний свіжий Google Sheets access_token (Windmill auto-refresh-ить через "
+            "свій gsheets OAuth resource). Якщо не передано — fallback на ENV."
+        ),
+    )
 
 
 class UploadResponse(BaseModel):
@@ -60,7 +67,7 @@ async def upload_xlsx(req: UploadRequest) -> UploadResponse:
              len(req.ref_ids), req.category, jobname)
 
     try:
-        rows_dict = fetch_rows_by_ref_ids(req.ref_ids)
+        rows_dict = fetch_rows_by_ref_ids(req.ref_ids, access_token=req.gsheets_access_token)
         if not rows_dict:
             return UploadResponse(
                 status="no_rows",

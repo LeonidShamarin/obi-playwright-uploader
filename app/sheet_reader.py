@@ -20,13 +20,23 @@ STOCK_COLUMN = "Stock - Hauptlager\n(total)"
 KEY_COLUMN = "Product Ref ID"
 
 
-def _get_client() -> gspread.Client:
+def _get_client(access_token: str | None = None) -> gspread.Client:
+    """
+    Якщо `access_token` передано — використовується напряму (Windmill сам auto-refresh-ить
+    через свій gsheets OAuth resource і шле свіжий токен у кожному запиті).
+    Інакше fallback на ENV GSHEETS_OAUTH_TOKEN_JSON (повний OAuth payload із refresh_token).
+    """
+    if access_token:
+        creds = Credentials(token=access_token,
+                            scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        return gspread.authorize(creds)
+
     if not settings.gsheets_oauth_token_json:
-        raise RuntimeError("GSHEETS_OAUTH_TOKEN_JSON not configured")
+        raise RuntimeError(
+            "Neither gsheets_access_token (request body) nor "
+            "GSHEETS_OAUTH_TOKEN_JSON (env) configured"
+        )
     raw = json.loads(settings.gsheets_oauth_token_json)
-    # Поля можуть прийти або від нашого Windmill-resource (`{token}`) — тоді треба refresh,
-    # або з .gsheets/token.json (повний google-auth payload).
-    # Найпростіше — використовуємо як bearer access token. Refresh — окрема логіка нижче.
     creds = Credentials(
         token=raw.get("token") or raw.get("access_token"),
         refresh_token=raw.get("refresh_token"),
@@ -38,11 +48,13 @@ def _get_client() -> gspread.Client:
     return gspread.authorize(creds)
 
 
-def fetch_rows_by_ref_ids(ref_ids: list[str]) -> dict[str, dict[str, Any]]:
+def fetch_rows_by_ref_ids(
+    ref_ids: list[str], access_token: str | None = None,
+) -> dict[str, dict[str, Any]]:
     """Повертає {ref_id: {col_name: value, ...}} для запитаних Ref ID."""
     if not ref_ids:
         return {}
-    client = _get_client()
+    client = _get_client(access_token=access_token)
     sh = client.open_by_key(settings.gsheets_spreadsheet_id)
 
     # Знаходимо worksheet за gid
