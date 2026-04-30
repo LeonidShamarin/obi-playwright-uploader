@@ -288,13 +288,28 @@ async def upload_xlsx_to_obi(
     await _frame_add_sku_images_multiselect(app_frame, page, SKU_IMAGE_COLUMNS_TO_MAP)
     screenshots.append(await _shot(page, "09_mapping_done"))
 
-    # ── 9. Click Weiter → start import ─────────────────────────────────────
-    next2 = await _wait_and_click(app_frame, page, "weiter", timeout_s=15)
+    # ── 9. Weiter → Step 3 (review) ─────────────────────────────────────────
+    next2 = await _wait_and_click(app_frame, page, "weiter", timeout_s=20)
     if next2:
-        log.info("Clicked Weiter (start import): %s", next2)
+        log.info("Clicked Weiter Step 2 → 3: %s", next2)
     else:
-        log.warning("Next button after mapping not found — продовжуємо до polling")
-        screenshots.append(await _shot(page, "WARN_no_next_after_mapping"))
+        log.warning("Weiter Step 2 → 3 not found")
+        screenshots.append(await _shot(page, "WARN_no_next_step2"))
+
+    await page.wait_for_timeout(2500)
+    screenshots.append(await _shot(page, "10_step3_review"))
+
+    # ── 9b. Weiter → Step 4 (status / start import) ─────────────────────────
+    # Користувач підтвердив: 4 кроки. На кроці 3 ще раз треба натиснути
+    # Weiter (or "Importieren") щоб реально запустити імпорт.
+    next3 = await _wait_and_click(app_frame, page, "weiter", timeout_s=15)
+    if not next3:
+        next3 = await _wait_and_click(app_frame, page, "importieren", timeout_s=10)
+    if next3:
+        log.info("Clicked Weiter Step 3 → 4: %s", next3)
+    else:
+        log.warning("Weiter Step 3 → 4 not found")
+        screenshots.append(await _shot(page, "WARN_no_next_step3"))
     try:
         await page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
@@ -579,131 +594,60 @@ async def _frame_pick_dropdown_option(frame: Frame, value: str):
 
 
 async def _frame_add_sku_images_multiselect(frame: Frame, page: Page, col_names: list[str]):
-    """VTEX SKU Images dropdown — open для КОЖНОЇ опції окремо.
+    """VTEX SKU Images combobox — type-and-Enter workflow.
 
-    Користувач підтвердив поведінку: dropdown ЗАКРИВАЄТЬСЯ після кожного
-    select. Тобто треба:
-      1. Click dropdown trigger
-      2. Click option N
-      3. Click dropdown trigger знову
-      4. Click option N+1
-      ... etc
+    Реальний UI: input[role=combobox] як searchable filter. Юзер-flow:
+      1. Click input (focus + open dropdown)
+      2. Type col_name (dropdown filters до 1 option)
+      3. Enter (select highlighted option → стає chip)
+      4. Repeat для наступного col_name
 
-    Тригер — combobox/input/button поруч з label "SKU Images". Шукаємо
-    walking up DOM tree (label.parentElement, parent.parentElement, ...).
+    Це stable бо не залежить від нестабільного role=option scraping.
     """
-    # JS-функція що знаходить trigger елемент (без click) — для diagnostic
-    diagnostic = await frame.evaluate(
+    # 1. Знаходимо SKU Images combobox через JS handle (specific row)
+    handle = await frame.evaluate_handle(
         """
         () => {
             const all = [...document.querySelectorAll('label, span, div, p')];
-            const label = all.find(el => (el.innerText || '').trim() === 'SKU Images');
-            if (!label) return {error: 'no_label'};
-            // Walk up to 6 ancestors looking for a control
+            const label = all.find(el => (el.textContent || '').trim() === 'SKU Images');
+            if (!label) return null;
             let scope = label.parentElement;
             for (let i = 0; i < 6 && scope; i++) {
-                const trigger = scope.querySelector(
-                    '[role="combobox"], input:not([type="hidden"]):not([type="file"]), button[aria-haspopup], [aria-expanded]'
-                );
-                if (trigger && trigger !== label) {
-                    return {
-                        ancestor_level: i,
-                        ancestor_tag: scope.tagName,
-                        ancestor_class: scope.className?.toString().slice(0,80),
-                        trigger_tag: trigger.tagName,
-                        trigger_role: trigger.getAttribute('role'),
-                        trigger_aria: trigger.getAttribute('aria-haspopup'),
-                        trigger_class: trigger.className?.toString().slice(0,80),
-                    };
-                }
+                const trigger = scope.querySelector('input[role="combobox"], [role="combobox"]');
+                if (trigger && trigger !== label) return trigger;
                 scope = scope.parentElement;
             }
-            return {error: 'no_trigger_in_6_ancestors'};
+            return null;
         }
         """
     )
-    log.info("SKU Images trigger diagnostic: %s", diagnostic)
-    if diagnostic.get("error"):
-        log.warning("Cannot find SKU Images dropdown trigger: %s", diagnostic)
+    el = handle.as_element()
+    if not el:
+        log.warning("SKU Images combobox not found")
         return
 
-    # Окрема JS-функція що відкриває dropdown — кличеться перед кожною опцією.
-    OPEN_JS = """
-        () => {
-            const all = [...document.querySelectorAll('label, span, div, p')];
-            const label = all.find(el => (el.innerText || '').trim() === 'SKU Images');
-            if (!label) return {error: 'no_label'};
-            let scope = label.parentElement;
-            for (let i = 0; i < 6 && scope; i++) {
-                const trigger = scope.querySelector(
-                    '[role="combobox"], input:not([type="hidden"]):not([type="file"]), button[aria-haspopup], [aria-expanded]'
-                );
-                if (trigger && trigger !== label) {
-                    trigger.scrollIntoView({block: 'center'});
-                    trigger.focus();
-                    trigger.click();
-                    return {opened: true, tag: trigger.tagName};
-                }
-                scope = scope.parentElement;
-            }
-            return {error: 'no_trigger'};
-        }
-    """
+    log.info("SKU Images combobox handle obtained")
 
     for col in col_names:
-        # 1. Open dropdown
-        opened = await frame.evaluate(OPEN_JS)
-        if opened.get("error"):
-            log.warning("Failed to re-open dropdown for %s: %s", col, opened)
-            continue
-        await page.wait_for_timeout(800)
-
-        # 2. Click option через Playwright locator — auto-wait для visibility,
-        #    і textContent-style match (через get_by_role("option", name=...))
-        clicked = False
         try:
-            opt = frame.get_by_role("option", name=col, exact=True)
-            count = await opt.count()
-            for idx in range(min(count, 5)):
-                cand = opt.nth(idx)
-                try:
-                    if not await cand.is_visible(timeout=300):
-                        continue
-                    await cand.scroll_into_view_if_needed(timeout=2000)
-                    await cand.click(timeout=3000)
-                    clicked = True
-                    log.info("Added SKU Images mapping: %s (role=option, idx=%d)", col, idx)
-                    break
-                except Exception:
-                    continue
+            # Click + scroll combobox into view → focus + open dropdown
+            await el.scroll_into_view_if_needed()
+            await el.click()
+            await page.wait_for_timeout(400)
+            # Clear будь-який existing input (на випадок якщо лишився text з прошлого)
+            await page.keyboard.press("Control+A")
+            await page.keyboard.press("Delete")
+            # Type col name char-by-char (delay щоб React встиг фільтрувати)
+            await page.keyboard.type(col, delay=40)
+            await page.wait_for_timeout(700)
+            # Enter selects the highlighted option (зазвичай top match)
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(500)
+            log.info("Typed+Enter for SKU Images mapping: %s", col)
         except Exception as e:
-            log.warning("get_by_role(option, %r) raised: %s", col, e)
+            log.exception("Failed to add %s: %s", col, e)
 
-        # Fallback: through page.get_by_text (any element exact text)
-        if not clicked:
-            try:
-                opt2 = frame.get_by_text(col, exact=True)
-                count2 = await opt2.count()
-                for idx in range(min(count2, 5)):
-                    cand2 = opt2.nth(idx)
-                    try:
-                        if not await cand2.is_visible(timeout=300):
-                            continue
-                        await cand2.scroll_into_view_if_needed(timeout=2000)
-                        await cand2.click(timeout=3000)
-                        clicked = True
-                        log.info("Added SKU Images mapping: %s (get_by_text, idx=%d)", col, idx)
-                        break
-                    except Exception:
-                        continue
-            except Exception as e:
-                log.warning("get_by_text(%r) raised: %s", col, e)
-
-        if not clicked:
-            log.warning("Option %r not clickable у dropdown", col)
-        await page.wait_for_timeout(500)
-
-    # Закриваємо останній dropdown (ESC) щоб не блокувати Weiter-клік
+    # Закриваємо dropdown
     try:
         await page.keyboard.press("Escape")
     except Exception:
@@ -774,26 +718,25 @@ async def _frame_add_sku_image_mapping(frame: Frame, col_name: str):
 
 
 async def _poll_status(page: Page, frame: Frame) -> tuple[str, dict | None]:
-    """Очікує completed/failed. Повертає (status, totals)."""
+    """Очікує "Job completed"/failed на Schritt 4. Без reload — preserve state."""
     for attempt in range(STATUS_POLL_MAX_TRIES):
+        # Re-find app frame on each iteration (URL може змінитись після імпорту)
         try:
-            text = await frame.evaluate("() => document.body.innerText.toLowerCase()")
-            if "completed" in text:
+            frame = await _wait_for_app_frame(page, timeout_s=5)
+        except RuntimeError:
+            pass
+        try:
+            text = await frame.evaluate("() => document.body.textContent.toLowerCase()")
+            if "job completed" in text or " completed" in text:
                 log.info("Import status: completed (attempt %d)", attempt + 1)
                 return "completed", await _read_totals(frame)
-            if "failed" in text or "fehlgeschlagen" in text:
+            if "fehlgeschlagen" in text or "job failed" in text or "import failed" in text:
                 log.info("Import status: failed (attempt %d)", attempt + 1)
                 return "failed", await _read_totals(frame)
             log.info("Import status pending (attempt %d/%d)", attempt + 1, STATUS_POLL_MAX_TRIES)
         except Exception:
             log.exception("Poll iteration failed")
         await asyncio.sleep(STATUS_POLL_INTERVAL)
-        try:
-            await page.reload(wait_until="domcontentloaded")
-            await page.wait_for_timeout(2000)
-            frame = await _wait_for_app_frame(page, timeout_s=10)
-        except Exception:
-            log.exception("Reload during polling failed")
     return "timeout", None
 
 
