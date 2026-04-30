@@ -27,7 +27,10 @@ log = logging.getLogger("browser.upload_flow")
 
 ADMIN_BASE_URL = "https://hajus679.myvtex.com/admin"
 APP_FRAME_MARKER = "/admin/app"  # iframe src
-SKU_IMAGE_COLUMNS_TO_MAP = [f"SKU Images {i}" for i in range(3, 11)]
+SKU_IMAGE_COLUMNS_TO_MAP = [
+    "SKU Images",  # перше поле — без числа (відповідає першому image-слоту)
+    *[f"SKU Images {i}" for i in range(3, 11)],  # 3..10 — наступні 8
+]  # всього 9 xlsx-колонок треба додати у VTEX SKU-Images dropdown
 STATUS_POLL_INTERVAL = 10
 STATUS_POLL_MAX_TRIES = 90  # 15 хв
 
