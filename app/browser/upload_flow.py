@@ -265,18 +265,25 @@ async def upload_xlsx_to_obi(
     screenshots.append(await _shot(page, "06_file_uploaded"))
 
     # ── 7. Click "Weiter" → mapping page ───────────────────────────────────
-    # Чекаємо до 20с поки blue Weiter button стане enabled (форма validated).
     next_clicked = await _wait_and_click(app_frame, page, "weiter", timeout_s=20)
     if not next_clicked:
         screenshots.append(await _shot(page, "ERR_no_next_after_upload"))
         raise RuntimeError("Could not click Weiter after file upload (button stayed disabled)")
-    log.info("Clicked Weiter: %s", next_clicked)
-    try:
-        await page.wait_for_load_state("networkidle", timeout=20000)
-    except Exception:
-        pass
-    await page.wait_for_timeout(2000)
+    log.info("Clicked Weiter Step 1 → 2: %s", next_clicked)
+
+    # VTEX показує "Wir bearbeiten Ihre Datei. Das kann eine Weile dauern."
+    # placeholder поки парсить xlsx. Треба чекати поки mapping fields
+    # зрендеряться (до 90s — для великих файлів).
     app_frame = await _wait_for_app_frame(page, timeout_s=10)
+    log.info("Waiting for mapping fields (Schritt 2 processing)...")
+    try:
+        await app_frame.get_by_text(
+            re.compile(r"Marketplace-Attribut|Product Information|Zuordnung", re.I)
+        ).first.wait_for(state="visible", timeout=90000)
+        log.info("Mapping fields rendered")
+    except Exception as e:
+        log.warning("Mapping fields wait timeout: %s", e)
+    await page.wait_for_timeout(1500)
     screenshots.append(await _shot(page, "07_mapping_page"))
 
     # ── 8. Mapping: add SKU Images 3..10 у multi-select combobox ────────────
@@ -288,7 +295,7 @@ async def upload_xlsx_to_obi(
     await _frame_add_sku_images_multiselect(app_frame, page, SKU_IMAGE_COLUMNS_TO_MAP)
     screenshots.append(await _shot(page, "09_mapping_done"))
 
-    # ── 9. Weiter → Step 3 (review) ─────────────────────────────────────────
+    # ── 9. Weiter → Step 3 ──────────────────────────────────────────────────
     next2 = await _wait_and_click(app_frame, page, "weiter", timeout_s=20)
     if next2:
         log.info("Clicked Weiter Step 2 → 3: %s", next2)
@@ -296,19 +303,21 @@ async def upload_xlsx_to_obi(
         log.warning("Weiter Step 2 → 3 not found")
         screenshots.append(await _shot(page, "WARN_no_next_step2"))
 
+    # Step 3 також може показати "Wir bearbeiten" placeholder. Чекаємо
+    # поки processing завершиться і Weiter стане enabled.
     await page.wait_for_timeout(2500)
     screenshots.append(await _shot(page, "10_step3_review"))
+    log.info("Waiting for Schritt 3 processing to finish...")
 
-    # ── 9b. Weiter → Step 4 (status / start import) ─────────────────────────
-    # Користувач підтвердив: 4 кроки. На кроці 3 ще раз треба натиснути
-    # Weiter (or "Importieren") щоб реально запустити імпорт.
-    next3 = await _wait_and_click(app_frame, page, "weiter", timeout_s=15)
+    # ── 9b. Weiter → Step 4 (start import) ─────────────────────────────────
+    # Чекаємо до 90с щоб Schritt 3 review/processing завершився
+    next3 = await _wait_and_click(app_frame, page, "weiter", timeout_s=90)
     if not next3:
-        next3 = await _wait_and_click(app_frame, page, "importieren", timeout_s=10)
+        next3 = await _wait_and_click(app_frame, page, "importieren", timeout_s=15)
     if next3:
         log.info("Clicked Weiter Step 3 → 4: %s", next3)
     else:
-        log.warning("Weiter Step 3 → 4 not found")
+        log.warning("Weiter Step 3 → 4 not found after 90s")
         screenshots.append(await _shot(page, "WARN_no_next_step3"))
     try:
         await page.wait_for_load_state("networkidle", timeout=20000)
@@ -717,19 +726,25 @@ async def _frame_add_sku_image_mapping(frame: Frame, col_name: str):
 
 
 async def _poll_status(page: Page, frame: Frame) -> tuple[str, dict | None]:
-    """Очікує "Job completed"/failed на Schritt 4. Без reload — preserve state."""
+    """Очікує "Job completed"/failed на Schritt 4. Без reload — preserve state.
+
+    Шукає СПЕЦИФІЧНІ маркери Schritt 4:
+      "job completed" — успіх
+      "job failed" / "fehlgeschlagen" — fail
+    Не матчимо просто "completed" бо у history list багато completed-rows.
+    """
     for attempt in range(STATUS_POLL_MAX_TRIES):
-        # Re-find app frame on each iteration (URL може змінитись після імпорту)
         try:
             frame = await _wait_for_app_frame(page, timeout_s=5)
         except RuntimeError:
             pass
         try:
-            text = await frame.evaluate("() => document.body.textContent.toLowerCase()")
-            if "job completed" in text or " completed" in text:
+            text = await frame.evaluate("() => document.body.textContent")
+            text_lc = text.lower()
+            if "job completed" in text_lc:
                 log.info("Import status: completed (attempt %d)", attempt + 1)
                 return "completed", await _read_totals(frame)
-            if "fehlgeschlagen" in text or "job failed" in text or "import failed" in text:
+            if "job failed" in text_lc or "import fehlgeschlagen" in text_lc:
                 log.info("Import status: failed (attempt %d)", attempt + 1)
                 return "failed", await _read_totals(frame)
             log.info("Import status pending (attempt %d/%d)", attempt + 1, STATUS_POLL_MAX_TRIES)
