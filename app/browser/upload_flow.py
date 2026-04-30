@@ -36,7 +36,10 @@ async def upload_xlsx_to_obi(
     page: Page, xlsx_bytes: bytes, jobname: str, category: str | None = None,
 ) -> dict:
     screenshots: list[str] = []
-    category = category or settings.obi_default_category
+    # "Duschwannen" — це відомий leaf-категорія в OBI catalog (видно з
+    # Historie importieren — багато успішних імпортів). settings.obi_default
+    # ("Sonstiges") може не існувати у дереві, тому беремо leaf-fallback.
+    category = category or "Duschwannen"
 
     # ── 1. Navigate to products + sidebar click ─────────────────────────────
     await page.goto(f"{ADMIN_BASE_URL}/products", wait_until="domcontentloaded")
@@ -135,73 +138,63 @@ async def upload_xlsx_to_obi(
         await page.wait_for_timeout(2500)
         screenshots.append(await _shot(page, "04_category_dropdown_open"))
 
-        # VTEX рендерить категорії як кастомну UI, де `<input type="radio">` —
-        # лише native fallback, а React-handler сидить на батьківському DIV.
-        # Найнадійніше — клікати на ВИДИМИЙ TEXT категорії через Playwright
-        # `get_by_text`, бо це генерує bounding-box click з реальним мишевим
-        # event-chain, який React-обробник 100% побачить.
+        # VTEX категорії — це 3-рівневе tree-select. Top-level узли
+        # ("[4908] Bäder, Küchen ...") мають subcategories і Confirm
+        # лишається disabled поки не обрано ЛИСТ (leaf node).
+        # Прагматично: використовуємо search input з category-назвою (default
+        # — settings.obi_default_category, fallback "Duschwannen" що завжди
+        # існує в OBI). Шукаємо input[placeholder*="Suche"|"Search"] і вводимо.
+        search_query = (category or "Duschwannen").strip()
+        log.info("Searching category in modal: %r", search_query)
         picked = {}
+        # 1. Заповнюємо search input
         try:
-            # Шукаємо видимий текст у форматі "[\d+] Назва..." (VTEX category id format)
-            cat_text = app_frame.get_by_text(re.compile(r"^\[\d+\]"), exact=False).first
-            if await cat_text.count():
-                await cat_text.click(force=True, timeout=5000)
-                box_text = await cat_text.text_content()
-                picked = {"clicked_via": "get_by_text", "text": (box_text or "").strip()[:80]}
-                log.info("Category clicked via text: %s", picked)
+            search_filled = await app_frame.evaluate(
+                """
+                (q) => {
+                    const dialog = document.querySelector('[role="dialog"], [class*="modal" i]') || document;
+                    const search = dialog.querySelector(
+                        'input[placeholder*="Suche" i], input[placeholder*="Search" i], input[type="search"]'
+                    );
+                    if (!search) return {error: 'no_search_input'};
+                    search.focus();
+                    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+                    setter.call(search, q);
+                    search.dispatchEvent(new Event('input', {bubbles: true}));
+                    search.dispatchEvent(new Event('change', {bubbles: true}));
+                    return {filled: q, placeholder: search.getAttribute('placeholder')};
+                }
+                """,
+                search_query,
+            )
+            log.info("Search filled: %s", search_filled)
         except Exception as e:
-            log.warning("get_by_text click failed: %s", e)
+            log.warning("Search fill failed: %s", e)
+        await page.wait_for_timeout(1500)
 
-        # Fallback 1: клік через Playwright по input[type=radio] первому
+        # 2. Клікаємо ПЕРШИЙ видимий результат (через Playwright text-locator
+        # для надійного user-event)
+        try:
+            # Знаходимо результат що містить наш query (case-insensitive)
+            result = app_frame.get_by_text(re.compile(re.escape(search_query), re.I)).first
+            if await result.count():
+                await result.click(force=True, timeout=5000)
+                txt = await result.text_content()
+                picked = {"clicked_via": "search_result", "text": (txt or "").strip()[:80]}
+                log.info("Category result clicked: %s", picked)
+        except Exception as e:
+            log.warning("Click search result failed: %s", e)
+
+        # Fallback: якщо search не дав результатів — клік першого видимого radio
         if not picked:
+            log.warning("Search yielded no clickable result; trying first radio leaf")
             try:
                 radio = app_frame.locator('input[type="radio"]').first
                 await radio.click(force=True, timeout=5000)
-                picked = {"clicked_via": "playwright_radio"}
-                log.info("Radio clicked via Playwright locator (force=True)")
+                picked = {"clicked_via": "fallback_radio"}
             except Exception as e:
-                log.warning("Radio click via locator failed: %s", e)
-
-        # Fallback 2: клік через JS bounding-box (mouse coords) на radio
-        if not picked:
-            try:
-                radio_handle = await app_frame.query_selector('input[type="radio"]')
-                if radio_handle:
-                    # Спершу spara — якщо input hidden, шукаємо visible label
-                    box = await radio_handle.bounding_box()
-                    if box and box.get("width", 0) > 0:
-                        cx = box["x"] + box["width"] / 2
-                        cy = box["y"] + box["height"] / 2
-                        await page.mouse.click(cx, cy)
-                        picked = {"clicked_via": "mouse_coords", "x": cx, "y": cy}
-                        log.info("Radio clicked via mouse coords: %s", picked)
-            except Exception as e:
-                log.warning("Mouse-coords click failed: %s", e)
-
-        # Fallback 3: повний MouseEvent dispatch у JS на parent label
-        if not picked:
-            picked = await app_frame.evaluate(
-                """
-                () => {
-                    const dialog = document.querySelector('[role="dialog"], .vtex-modal, [class*="modal" i]');
-                    const scope = dialog || document;
-                    const radio = scope.querySelector('input[type="radio"]');
-                    if (!radio) return {error: 'no_radio'};
-                    const target = radio.closest('label, [class*="row" i], [class*="item" i]') || radio;
-                    // Full event chain
-                    for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {
-                        target.dispatchEvent(new MouseEvent(t, {bubbles: true, cancelable: true, view: window, button: 0}));
-                    }
-                    // Force checked + change (для уникнення випадку коли клік не спрацював)
-                    const setChecked = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'checked').set;
-                    setChecked.call(radio, true);
-                    radio.dispatchEvent(new Event('input', {bubbles: true}));
-                    radio.dispatchEvent(new Event('change', {bubbles: true}));
-                    return {clicked_via: 'full_event_chain', tag: target.tagName};
-                }
-                """
-            )
-            log.info("Radio fallback (full event chain): %s", picked)
+                log.exception("All category-pick strategies failed: %s", e)
+                picked = {"error": "all_strategies_failed"}
 
         # Чекаємо поки Confirm стане enabled (до 6 сек)
         for tick in range(12):
