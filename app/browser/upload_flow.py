@@ -95,15 +95,15 @@ async def upload_xlsx_to_obi(
     log.info("After sidebar click, URL=%s", page.url)
     screenshots.append(await _shot(page, "00_produktimport_loaded"))
 
-    # Polling-search для Neuimport button до 25s
+    # Polling-search для "Neuer Import" / "Neuimport" / "New Import" button до 25s
     new_btn = None
+    new_import_re = re.compile(r"Neuer\s+Import|Neuimport|New\s+Import", re.I)
     candidate_factories = [
-        ('role:button name~="Neuimport"', lambda: page.get_by_role("button", name=re.compile(r"Neuimport", re.I))),
-        ('role:button name~="new import"', lambda: page.get_by_role("button", name=re.compile(r"new\s*import", re.I))),
-        ('role:link name~="Neuimport"',   lambda: page.get_by_role("link",   name=re.compile(r"Neuimport", re.I))),
-        ('text=Neuimport',                lambda: page.get_by_text(re.compile(r"Neuimport", re.I))),
+        ('role:button name~="Neuer Import"', lambda: page.get_by_role("button", name=new_import_re)),
+        ('role:link name~="Neuer Import"',   lambda: page.get_by_role("link",   name=new_import_re)),
+        ('text=Neuer Import',                lambda: page.get_by_text(new_import_re)),
     ]
-    log.info("Polling до 25s для Neuimport button...")
+    log.info("Polling до 25s для Neuer-Import button...")
     elapsed = 0.0
     while elapsed < 25.0:
         for label, factory in candidate_factories:
