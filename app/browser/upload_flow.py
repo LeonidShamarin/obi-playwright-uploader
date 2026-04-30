@@ -411,21 +411,61 @@ async def _try_click_in_any_frame(page: Page, needle: str) -> tuple[Frame | None
 
 
 async def _frame_click_by_text(frame: Frame, needle: str) -> dict | None:
-    """JS click на button/a/[role=button] чий innerText/aria-label містить needle (case-insensitive)."""
+    """Клік на button/link з accessible name = needle.
+
+    Приоритет:
+      1. Playwright get_by_role("button"|"link", name=regex) → реальний user-event
+      2. JS fallback з фільтром visibility (відкидаємо hidden buttons)
+    """
+    pat = re.compile(re.escape(needle), re.I)
+    # 1. Playwright role-based locator (real user click events)
+    for role in ("button", "link"):
+        try:
+            loc = frame.get_by_role(role, name=pat)
+            count = await loc.count()
+            for idx in range(min(count, 10)):
+                cand = loc.nth(idx)
+                try:
+                    if not await cand.is_visible(timeout=300):
+                        continue
+                    box = await cand.bounding_box()
+                    if not box or box.get("width", 0) < 5 or box.get("height", 0) < 5:
+                        continue
+                    await cand.scroll_into_view_if_needed(timeout=2000)
+                    await cand.click(force=True, timeout=5000)
+                    name = (await cand.text_content()) or await cand.get_attribute("aria-label") or ""
+                    return {
+                        "tag": role.upper(),
+                        "text": name.strip()[:80],
+                        "via": "playwright_role",
+                        "idx": idx,
+                    }
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    # 2. JS fallback з visibility-фільтром
     try:
         return await frame.evaluate(
             """
             (needle) => {
                 const lc = needle.toLowerCase();
                 const targets = [...document.querySelectorAll('button, a, [role="button"], [type="submit"]')];
-                const found = targets.find(el =>
+                // Тільки ВИДИМІ елементи
+                const visible = targets.filter(el => {
+                    if (el.disabled) return false;
+                    const r = el.getBoundingClientRect();
+                    return r.width >= 5 && r.height >= 5 && r.top < window.innerHeight + 500;
+                });
+                const found = visible.find(el =>
                     (el.innerText || '').toLowerCase().includes(lc)
                     || (el.getAttribute('aria-label') || '').toLowerCase().includes(lc)
                 );
                 if (found) {
                     found.scrollIntoView({block: 'center'});
                     found.click();
-                    return {tag: found.tagName, text: (el => (el.innerText || '').trim().slice(0, 80))(found)};
+                    return {tag: found.tagName, text: (found.innerText || '').trim().slice(0, 80), via: 'js_visible'};
                 }
                 return null;
             }
