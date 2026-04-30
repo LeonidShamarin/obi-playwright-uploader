@@ -59,6 +59,34 @@ def health() -> dict:
     return {"ok": True, "service": "obi-playwright-uploader", "version": "0.1.0"}
 
 
+@app.get("/screenshots", dependencies=[Depends(require_bearer)])
+def list_screenshots() -> dict:
+    """Список доступних скріншотів."""
+    from pathlib import Path
+    p = Path(settings.screenshot_dir)
+    if not p.exists():
+        return {"files": []}
+    files = sorted(
+        [f.name for f in p.iterdir() if f.is_file()],
+        reverse=True,
+    )
+    return {"files": files, "dir": str(p)}
+
+
+@app.get("/screenshot/{filename}", dependencies=[Depends(require_bearer)])
+def get_screenshot(filename: str):
+    """Віддає screenshot як image/png. Bearer-protected."""
+    from pathlib import Path
+    from fastapi.responses import FileResponse
+    # Захист від path traversal
+    if "/" in filename or ".." in filename or "\\" in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    path = Path(settings.screenshot_dir) / filename
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(path, media_type="image/png", filename=filename)
+
+
 @app.post("/upload-xlsx", response_model=UploadResponse, dependencies=[Depends(require_bearer)])
 async def upload_xlsx(req: UploadRequest) -> UploadResponse:
     """Прокидує товари за списком Ref ID у OBI через UI-імпорт."""
