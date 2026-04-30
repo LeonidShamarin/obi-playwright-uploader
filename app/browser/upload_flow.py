@@ -110,19 +110,47 @@ async def upload_xlsx_to_obi(
                                  placeholder_pat=r"Jobname|Importauftrag|job")
     screenshots.append(await _shot(page, "03_jobname_filled"))
 
-    # ── 5. Kategorie wählen ─────────────────────────────────────────────────
+    # ── 5. Kategorie wählen → modal з radio-списком + Confirm ───────────────
     cat_clicked = await _frame_click_by_text(app_frame, "kategorie wählen")
     if not cat_clicked:
         cat_clicked = await _frame_click_by_text(app_frame, "kategorie")
     if cat_clicked:
         log.info("Clicked Kategorie wählen: %s", cat_clicked)
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(2500)
         screenshots.append(await _shot(page, "04_category_dropdown_open"))
-        # Search для category, click first
-        await _frame_pick_dropdown_option(app_frame, category)
+        # Click перший radio у dialog + Confirm
+        picked = await app_frame.evaluate(
+            """
+            () => {
+                // Шукаємо dialog/role=dialog або клас з 'modal'
+                const dialog = document.querySelector('[role="dialog"], .vtex-modal, [class*="modal" i]');
+                const scope = dialog || document;
+                // Перший radio
+                const radio = scope.querySelector('input[type="radio"]');
+                if (!radio) return {error: 'no_radio'};
+                radio.click();
+                return {radio_value: radio.value, name: radio.name};
+            }
+            """
+        )
+        log.info("Category radio clicked: %s", picked)
+        await page.wait_for_timeout(800)
+        # Click Confirm
+        confirmed = await app_frame.evaluate(
+            """
+            () => {
+                const btns = [...document.querySelectorAll('button')];
+                const found = btns.find(b => /confirm|bestätigen|ok\\b/i.test(b.innerText || ''));
+                if (found && !found.disabled) { found.click(); return {clicked: found.innerText.trim()}; }
+                return {error: 'no_confirm', buttons: btns.map(b => (b.innerText || '').trim()).filter(Boolean).slice(0,20)};
+            }
+            """
+        )
+        log.info("Confirm clicked: %s", confirmed)
+        await page.wait_for_timeout(2000)
         screenshots.append(await _shot(page, "05_category_picked"))
     else:
-        log.warning("Kategorie wählen button not found — пробуємо без вибору")
+        log.warning("Kategorie wählen button not found")
         screenshots.append(await _shot(page, "WARN_no_kategorie_btn"))
 
     # ── 6. Upload xlsx ──────────────────────────────────────────────────────
@@ -142,7 +170,9 @@ async def upload_xlsx_to_obi(
     screenshots.append(await _shot(page, "06_file_uploaded"))
 
     # ── 7. Click "Nächster Schritt" → mapping page ─────────────────────────
-    next_clicked = await _frame_click_by_text(app_frame, "nächster")
+    next_clicked = await _frame_click_by_text(app_frame, "weiter")
+    if not next_clicked:
+        next_clicked = await _frame_click_by_text(app_frame, "nächster")
     if not next_clicked:
         next_clicked = await _frame_click_by_text(app_frame, "next")
     if not next_clicked:
