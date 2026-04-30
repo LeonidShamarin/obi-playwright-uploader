@@ -130,20 +130,64 @@ async def upload_xlsx_to_obi(
         elapsed += 2
 
     if new_btn is None:
-        screenshots.append(await _shot(page, "ERR_neuimport_not_found"))
-        raise RuntimeError(
-            f"+Neuimport button not found on Produktimport page after 25s polling "
-            f"(URL: {page.url}). Перевір screenshots."
-        )
+        # Diagnostic: подивимось всі кнопки і посилання на сторінці
+        try:
+            elements_info = await page.evaluate("""
+                () => {
+                    const collect = (sel) => Array.from(document.querySelectorAll(sel))
+                        .map(el => ({
+                            tag: el.tagName,
+                            text: (el.innerText || '').trim().slice(0, 60),
+                            aria: el.getAttribute('aria-label') || '',
+                            role: el.getAttribute('role') || '',
+                        }))
+                        .filter(x => x.text.length > 0 || x.aria.length > 0);
+                    return {
+                        buttons: collect('button'),
+                        links: collect('a'),
+                        role_buttons: collect('[role="button"]'),
+                    };
+                }
+            """)
+            log.info("Page elements debug: %s", elements_info)
+        except Exception:
+            log.exception("Failed to enumerate page elements")
 
-    try:
-        await new_btn.click(timeout=15000)
-    except Exception:
-        screenshots.append(await _shot(page, "ERR_neuimport_click_failed"))
-        raise
-
-    await page.wait_for_load_state("networkidle", timeout=20000)
-    screenshots.append(await _shot(page, "01_neuimport_open"))
+        # Спроба JS-click через innerText match
+        log.info("Trying JS click via innerText match...")
+        clicked_via_js = await page.evaluate("""
+            () => {
+                const targets = [...document.querySelectorAll('button, a, [role="button"]')];
+                const found = targets.find(el =>
+                    (el.innerText || '').toLowerCase().includes('neuer import')
+                    || (el.getAttribute('aria-label') || '').toLowerCase().includes('neuer import')
+                );
+                if (found) {
+                    found.scrollIntoView({block: 'center'});
+                    found.click();
+                    return {tag: found.tagName, text: (found.innerText || '').trim().slice(0, 60)};
+                }
+                return null;
+            }
+        """)
+        if clicked_via_js:
+            log.info("JS click succeeded on element: %s", clicked_via_js)
+            await page.wait_for_load_state("networkidle", timeout=20000)
+            screenshots.append(await _shot(page, "01_neuimport_open"))
+        else:
+            screenshots.append(await _shot(page, "ERR_neuimport_not_found"))
+            raise RuntimeError(
+                f"Neuer Import button not found (URL: {page.url}). "
+                "Перевір screenshots/ERR_neuimport_not_found.png + Coolify logs."
+            )
+    else:
+        try:
+            await new_btn.click(timeout=15000)
+        except Exception:
+            screenshots.append(await _shot(page, "ERR_neuimport_click_failed"))
+            raise
+        await page.wait_for_load_state("networkidle", timeout=20000)
+        screenshots.append(await _shot(page, "01_neuimport_open"))
 
     # Jobname
     jobname_input = page.locator('input[name*="job" i], input[id*="job" i]').first
