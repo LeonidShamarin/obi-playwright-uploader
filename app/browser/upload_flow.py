@@ -90,15 +90,19 @@ async def upload_xlsx_to_obi(
             f"Could not click 'Neuer Import' in any frame. Frames: {all_frames}"
         )
     log.info("Clicked 'Neuer Import' in frame %s: %s", clicked.get("frame_url"), clicked)
+    # Modal може відкритись у тому ж frame, без navigation. Просто чекаємо рендер.
     await page.wait_for_timeout(3000)
     try:
-        await page.wait_for_load_state("networkidle", timeout=20000)
+        await page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
         pass
-    # Після navigation шукаємо frame з new-import у URL
-    app_frame = await _wait_for_app_frame(
-        page, timeout_s=20, url_must_contain="new-import"
-    )
+    # Перевіряємо: чи є frame з new-import (якщо modal це окремий iframe), інакше залишаємось на target_frame
+    try:
+        app_frame = await _wait_for_app_frame(page, timeout_s=5, url_must_contain="new-import")
+        log.info("Found new-import sub-frame: %s", app_frame.url)
+    except RuntimeError:
+        app_frame = target_frame
+        log.info("Modal stays in same frame, using target_frame: %s", app_frame.url)
     screenshots.append(await _shot(page, "02_neuimport_form"))
 
     # ── 4. Fill Jobname ─────────────────────────────────────────────────────
