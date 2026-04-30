@@ -69,23 +69,36 @@ async def upload_xlsx_to_obi(
     log.info("After sidebar click URL=%s", page.url)
     screenshots.append(await _shot(page, "01_product_imports_list"))
 
-    # ── 2. Find app frame ────────────────────────────────────────────────────
-    app_frame = await _wait_for_app_frame(page, timeout_s=20)
+    # ── 2. Find app frame з seller-product-importer URL ──────────────────────
+    app_frame = await _wait_for_app_frame(
+        page, timeout_s=25, url_must_contain="seller-product-importer"
+    )
     log.info("App frame ready: %s", app_frame.url)
 
-    # ── 3. Click "Neuer Import" inside app frame ─────────────────────────────
-    clicked = await _frame_click_by_text(app_frame, "neuer import")
+    # ── 3. Click "Neuer Import" — пробуємо в усіх frames ─────────────────────
+    target_frame, clicked = None, None
+    for attempt in range(15):
+        target_frame, clicked = await _try_click_in_any_frame(page, "neuer import")
+        if clicked:
+            break
+        await asyncio.sleep(2)
     if not clicked:
-        screenshots.append(await _shot(page, "ERR_neuimport_in_frame"))
-        raise RuntimeError("Could not click 'Neuer Import' in app frame")
-    log.info("Clicked 'Neuer Import': %s", clicked)
+        screenshots.append(await _shot(page, "ERR_neuimport_no_frame"))
+        # Diagnostic
+        all_frames = [(f.name, f.url) for f in page.frames]
+        raise RuntimeError(
+            f"Could not click 'Neuer Import' in any frame. Frames: {all_frames}"
+        )
+    log.info("Clicked 'Neuer Import' in frame %s: %s", clicked.get("frame_url"), clicked)
     await page.wait_for_timeout(3000)
     try:
         await page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
         pass
-    # frame-ref може застаріти після navigation — оновлюємо
-    app_frame = await _wait_for_app_frame(page, timeout_s=20)
+    # Після navigation шукаємо frame з new-import у URL
+    app_frame = await _wait_for_app_frame(
+        page, timeout_s=20, url_must_contain="new-import"
+    )
     screenshots.append(await _shot(page, "02_neuimport_form"))
 
     # ── 4. Fill Jobname ─────────────────────────────────────────────────────
@@ -215,17 +228,60 @@ async def _find_in_main(page: Page, candidates: list, label: str, timeout_s: int
     return None
 
 
-async def _wait_for_app_frame(page: Page, timeout_s: int = 20) -> Frame:
+async def _wait_for_app_frame(page: Page, timeout_s: int = 20, url_must_contain: str | None = None) -> Frame:
+    """Знаходить app iframe. Якщо url_must_contain заданий — чекає поки frame з цим в URL з'явиться."""
     elapsed = 0
+    last_seen: list[str] = []
     while elapsed < timeout_s:
+        last_seen = []
         for frame in page.frames:
             if frame == page.main_frame:
                 continue
-            if APP_FRAME_MARKER in (frame.url or ""):
-                return frame
+            url = frame.url or ""
+            last_seen.append(url)
+            if APP_FRAME_MARKER not in url:
+                continue
+            if url_must_contain and url_must_contain not in url:
+                continue
+            return frame
         await asyncio.sleep(1)
         elapsed += 1
-    raise RuntimeError(f"App iframe (containing {APP_FRAME_MARKER}) not found")
+    raise RuntimeError(
+        f"App iframe (containing {APP_FRAME_MARKER}, must_contain={url_must_contain}) not found. "
+        f"Seen frames: {last_seen}"
+    )
+
+
+async def _try_click_in_any_frame(page: Page, needle: str) -> tuple[Frame | None, dict | None]:
+    """Перебирає всі non-main frames і пробує JS-click за needle. Повертає (frame, click_info) або (None, None)."""
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+        try:
+            result = await frame.evaluate(
+                """
+                (n) => {
+                    const lc = n.toLowerCase();
+                    const targets = [...document.querySelectorAll('button, a, [role="button"], [type="submit"]')];
+                    const found = targets.find(el =>
+                        (el.innerText || '').toLowerCase().includes(lc)
+                        || (el.getAttribute('aria-label') || '').toLowerCase().includes(lc)
+                    );
+                    if (found) {
+                        found.scrollIntoView({block: 'center'});
+                        found.click();
+                        return {tag: found.tagName, text: (found.innerText || '').trim().slice(0, 80), frame_url: location.href};
+                    }
+                    return null;
+                }
+                """,
+                needle,
+            )
+            if result:
+                return frame, result
+        except Exception:
+            continue
+    return None, None
 
 
 async def _frame_click_by_text(frame: Frame, needle: str) -> dict | None:
