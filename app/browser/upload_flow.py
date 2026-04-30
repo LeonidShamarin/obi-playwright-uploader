@@ -630,19 +630,18 @@ async def _frame_add_sku_images_multiselect(frame: Frame, page: Page, col_names:
 
     for col in col_names:
         try:
-            # Click + scroll combobox into view → focus + open dropdown
+            # Click combobox → focus + open dropdown. БЕЗ Ctrl+A —
+            # бо у multi-select combobox це могло б видалити вже-додані
+            # chips (попередні mapped image columns).
             await el.scroll_into_view_if_needed()
             await el.click()
-            await page.wait_for_timeout(400)
-            # Clear будь-який existing input (на випадок якщо лишився text з прошлого)
-            await page.keyboard.press("Control+A")
-            await page.keyboard.press("Delete")
-            # Type col name char-by-char (delay щоб React встиг фільтрувати)
-            await page.keyboard.type(col, delay=40)
-            await page.wait_for_timeout(700)
-            # Enter selects the highlighted option (зазвичай top match)
-            await page.keyboard.press("Enter")
             await page.wait_for_timeout(500)
+            # Type col name (filters dropdown options)
+            await page.keyboard.type(col, delay=40)
+            await page.wait_for_timeout(800)
+            # Enter selects the highlighted (top filtered) option → стає chip
+            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(600)
             log.info("Typed+Enter for SKU Images mapping: %s", col)
         except Exception as e:
             log.exception("Failed to add %s: %s", col, e)
