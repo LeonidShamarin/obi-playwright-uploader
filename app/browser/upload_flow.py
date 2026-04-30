@@ -135,43 +135,73 @@ async def upload_xlsx_to_obi(
         await page.wait_for_timeout(2500)
         screenshots.append(await _shot(page, "04_category_dropdown_open"))
 
-        # Click LABEL/row containing the first radio — VTEX renders radios as
-        # custom UI, тому input.click() не реєструється у React. Натомість
-        # клікаємо контейнер (label/listrow), який слухає user input event.
+        # VTEX рендерить категорії як кастомну UI, де `<input type="radio">` —
+        # лише native fallback, а React-handler сидить на батьківському DIV.
+        # Найнадійніше — клікати на ВИДИМИЙ TEXT категорії через Playwright
+        # `get_by_text`, бо це генерує bounding-box click з реальним мишевим
+        # event-chain, який React-обробник 100% побачить.
+        picked = {}
         try:
-            # Спочатку пробуємо через Playwright locator з force=True (обхід
-            # перевірки видимості, бо input може бути hidden під custom UI).
-            radio = app_frame.locator('input[type="radio"]').first
-            await radio.click(force=True, timeout=5000)
-            log.info("Radio clicked via Playwright locator (force=True)")
+            # Шукаємо видимий текст у форматі "[\d+] Назва..." (VTEX category id format)
+            cat_text = app_frame.get_by_text(re.compile(r"^\[\d+\]"), exact=False).first
+            if await cat_text.count():
+                await cat_text.click(force=True, timeout=5000)
+                box_text = await cat_text.text_content()
+                picked = {"clicked_via": "get_by_text", "text": (box_text or "").strip()[:80]}
+                log.info("Category clicked via text: %s", picked)
         except Exception as e:
-            log.warning("Radio click via locator failed: %s — fallback to JS label-click", e)
+            log.warning("get_by_text click failed: %s", e)
 
-        # Fallback/duplicate: клік по батьківському label (емулює user click)
-        picked = await app_frame.evaluate(
-            """
-            () => {
-                const dialog = document.querySelector('[role="dialog"], .vtex-modal, [class*="modal" i]');
-                const scope = dialog || document;
-                const radio = scope.querySelector('input[type="radio"]');
-                if (!radio) return {error: 'no_radio'};
-                // VTEX wrapу радіо у label або div-row. Клік по label
-                // правильно тригерить React-handlers.
-                let target = radio.closest('label');
-                if (!target) {
-                    // fallback — найближчий клікабельний контейнер
-                    target = radio.closest('[class*="row" i], [class*="item" i], div');
+        # Fallback 1: клік через Playwright по input[type=radio] первому
+        if not picked:
+            try:
+                radio = app_frame.locator('input[type="radio"]').first
+                await radio.click(force=True, timeout=5000)
+                picked = {"clicked_via": "playwright_radio"}
+                log.info("Radio clicked via Playwright locator (force=True)")
+            except Exception as e:
+                log.warning("Radio click via locator failed: %s", e)
+
+        # Fallback 2: клік через JS bounding-box (mouse coords) на radio
+        if not picked:
+            try:
+                radio_handle = await app_frame.query_selector('input[type="radio"]')
+                if radio_handle:
+                    # Спершу spara — якщо input hidden, шукаємо visible label
+                    box = await radio_handle.bounding_box()
+                    if box and box.get("width", 0) > 0:
+                        cx = box["x"] + box["width"] / 2
+                        cy = box["y"] + box["height"] / 2
+                        await page.mouse.click(cx, cy)
+                        picked = {"clicked_via": "mouse_coords", "x": cx, "y": cy}
+                        log.info("Radio clicked via mouse coords: %s", picked)
+            except Exception as e:
+                log.warning("Mouse-coords click failed: %s", e)
+
+        # Fallback 3: повний MouseEvent dispatch у JS на parent label
+        if not picked:
+            picked = await app_frame.evaluate(
+                """
+                () => {
+                    const dialog = document.querySelector('[role="dialog"], .vtex-modal, [class*="modal" i]');
+                    const scope = dialog || document;
+                    const radio = scope.querySelector('input[type="radio"]');
+                    if (!radio) return {error: 'no_radio'};
+                    const target = radio.closest('label, [class*="row" i], [class*="item" i]') || radio;
+                    // Full event chain
+                    for (const t of ['pointerdown','mousedown','pointerup','mouseup','click']) {
+                        target.dispatchEvent(new MouseEvent(t, {bubbles: true, cancelable: true, view: window, button: 0}));
+                    }
+                    // Force checked + change (для уникнення випадку коли клік не спрацював)
+                    const setChecked = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'checked').set;
+                    setChecked.call(radio, true);
+                    radio.dispatchEvent(new Event('input', {bubbles: true}));
+                    radio.dispatchEvent(new Event('change', {bubbles: true}));
+                    return {clicked_via: 'full_event_chain', tag: target.tagName};
                 }
-                if (target) {
-                    target.click();
-                    return {clicked_via: target.tagName, class: target.className?.toString().slice(0,80)};
-                }
-                radio.click();
-                return {clicked_via: 'INPUT'};
-            }
-            """
-        )
-        log.info("Category label/radio clicked: %s", picked)
+                """
+            )
+            log.info("Radio fallback (full event chain): %s", picked)
 
         # Чекаємо поки Confirm стане enabled (до 6 сек)
         for tick in range(12):
