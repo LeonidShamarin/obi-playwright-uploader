@@ -75,34 +75,50 @@ async def upload_xlsx_to_obi(
     )
     log.info("App frame ready: %s", app_frame.url)
 
-    # ── 3. Click "Neuer Import" — пробуємо в усіх frames ─────────────────────
-    target_frame, clicked = None, None
-    for attempt in range(15):
-        target_frame, clicked = await _try_click_in_any_frame(page, "neuer import")
+    # ── 3. Click "Neuer Import" + verify new-import frame ───────────────────
+    # Раніше клік був "stateless" — _try_click_in_any_frame повертав truthy
+    # навіть коли React-handler не зреєстрував подію і модалка не відкривалась.
+    # Тепер після кожного кліку перевіряємо появу new-import iframe з retry.
+    new_import_frame = None
+    target_frame = app_frame
+    for attempt in range(6):
+        # Click via _try_click_in_any_frame (працює для всіх frames)
+        tf, clicked = await _try_click_in_any_frame(page, "neuer import")
         if clicked:
+            target_frame = tf
+            log.info("Clicked 'Neuer Import' attempt %d in frame: %s",
+                     attempt + 1, clicked.get("frame_url"))
+        else:
+            log.warning("Could not find 'Neuer Import' button (attempt %d)", attempt + 1)
+            await asyncio.sleep(2)
+            continue
+        # Чекаємо до 15s на new-import frame
+        try:
+            new_import_frame = await _wait_for_app_frame(
+                page, timeout_s=15, url_must_contain="new-import"
+            )
+            log.info("Found new-import sub-frame: %s", new_import_frame.url)
             break
-        await asyncio.sleep(2)
-    if not clicked:
+        except RuntimeError:
+            log.warning(
+                "new-import frame did not appear after click %d — retrying", attempt + 1
+            )
+            screenshots.append(
+                await _shot(page, f"WARN_no_new_import_frame_attempt{attempt + 1}")
+            )
+            await asyncio.sleep(3)
+
+    if new_import_frame:
+        app_frame = new_import_frame
+    elif target_frame:
+        app_frame = target_frame
+        log.warning("Modal stays in same frame, using target_frame: %s", app_frame.url)
+    else:
         screenshots.append(await _shot(page, "ERR_neuimport_no_frame"))
-        # Diagnostic
         all_frames = [(f.name, f.url) for f in page.frames]
         raise RuntimeError(
             f"Could not click 'Neuer Import' in any frame. Frames: {all_frames}"
         )
-    log.info("Clicked 'Neuer Import' in frame %s: %s", clicked.get("frame_url"), clicked)
-    # Дамо більше часу — VTEX іноді повільно піднімає new-import iframe.
-    await page.wait_for_timeout(5000)
-    try:
-        await page.wait_for_load_state("networkidle", timeout=20000)
-    except Exception:
-        pass
-    # Чекаємо до 25s на frame з new-import
-    try:
-        app_frame = await _wait_for_app_frame(page, timeout_s=25, url_must_contain="new-import")
-        log.info("Found new-import sub-frame: %s", app_frame.url)
-    except RuntimeError:
-        app_frame = target_frame
-        log.info("Modal stays in same frame, using target_frame: %s", app_frame.url)
     screenshots.append(await _shot(page, "02_neuimport_form"))
 
     # ── 4. Fill Jobname ─────────────────────────────────────────────────────
