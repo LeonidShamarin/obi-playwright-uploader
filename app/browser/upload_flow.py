@@ -27,10 +27,9 @@ log = logging.getLogger("browser.upload_flow")
 
 ADMIN_BASE_URL = "https://hajus679.myvtex.com/admin"
 APP_FRAME_MARKER = "/admin/app"  # iframe src
-SKU_IMAGE_COLUMNS_TO_MAP = [
-    "SKU Images",  # перше поле — без числа (відповідає першому image-слоту)
-    *[f"SKU Images {i}" for i in range(3, 11)],  # 3..10 — наступні 8
-]  # всього 9 xlsx-колонок треба додати у VTEX SKU-Images dropdown
+SKU_IMAGE_COLUMNS_TO_MAP = [f"SKU Images {i}" for i in range(3, 11)]
+# "SKU Images" (без числа) вже auto-mapped VTEX-ом по точному name-match.
+# Треба додатково обрати тільки 3..10 — це 8 опцій з multi-select dropdown.
 STATUS_POLL_INTERVAL = 10
 STATUS_POLL_MAX_TRIES = 90  # 15 хв
 
@@ -265,16 +264,13 @@ async def upload_xlsx_to_obi(
     await page.wait_for_timeout(3000)
     screenshots.append(await _shot(page, "06_file_uploaded"))
 
-    # ── 7. Click "Nächster Schritt" → mapping page ─────────────────────────
-    next_clicked = await _frame_click_by_text(app_frame, "weiter")
-    if not next_clicked:
-        next_clicked = await _frame_click_by_text(app_frame, "nächster")
-    if not next_clicked:
-        next_clicked = await _frame_click_by_text(app_frame, "next")
+    # ── 7. Click "Weiter" → mapping page ───────────────────────────────────
+    # Чекаємо до 20с поки blue Weiter button стане enabled (форма validated).
+    next_clicked = await _wait_and_click(app_frame, page, "weiter", timeout_s=20)
     if not next_clicked:
         screenshots.append(await _shot(page, "ERR_no_next_after_upload"))
-        raise RuntimeError("Could not click Nächster after file upload")
-    log.info("Clicked Nächster: %s", next_clicked)
+        raise RuntimeError("Could not click Weiter after file upload (button stayed disabled)")
+    log.info("Clicked Weiter: %s", next_clicked)
     try:
         await page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
@@ -283,27 +279,17 @@ async def upload_xlsx_to_obi(
     app_frame = await _wait_for_app_frame(page, timeout_s=10)
     screenshots.append(await _shot(page, "07_mapping_page"))
 
-    # ── 8. Mapping: add SKU Images 3..10 ────────────────────────────────────
+    # ── 8. Mapping: add SKU Images 3..10 у multi-select combobox ────────────
     log.info("Mapping: expand Product Content + add %d image columns", len(SKU_IMAGE_COLUMNS_TO_MAP))
-    # Розгортаємо Product Content
     await _frame_click_by_text(app_frame, "product content")
-    await page.wait_for_timeout(1000)
+    await page.wait_for_timeout(1500)
     screenshots.append(await _shot(page, "08_product_content_open"))
 
-    for col in SKU_IMAGE_COLUMNS_TO_MAP:
-        await _frame_add_sku_image_mapping(app_frame, col)
+    await _frame_add_sku_images_multiselect(app_frame, page, SKU_IMAGE_COLUMNS_TO_MAP)
     screenshots.append(await _shot(page, "09_mapping_done"))
 
     # ── 9. Click Weiter → start import ─────────────────────────────────────
-    # Користувач підтвердив: після мапінгу натискається синя "Weiter"
-    # вгорі сторінки (не "Nächster"). Спершу пробуємо її, далі fallbacks.
-    next2 = await _frame_click_by_text(app_frame, "weiter")
-    if not next2:
-        next2 = await _frame_click_by_text(app_frame, "nächster")
-    if not next2:
-        next2 = await _frame_click_by_text(app_frame, "next")
-    if not next2:
-        next2 = await _frame_click_by_text(app_frame, "importieren")
+    next2 = await _wait_and_click(app_frame, page, "weiter", timeout_s=15)
     if next2:
         log.info("Clicked Weiter (start import): %s", next2)
     else:
@@ -419,6 +405,24 @@ async def _try_click_in_any_frame(page: Page, needle: str) -> tuple[Frame | None
         except Exception:
             continue
     return None, None
+
+
+async def _wait_and_click(frame: Frame, page: Page, needle: str, timeout_s: int = 20) -> dict | None:
+    """Polling: чекає поки button з accessible name=needle стане enabled, тоді клікає.
+
+    Корисно для Weiter-кнопки що з'являється DISABLED поки форма не валідна,
+    і стає ENABLED коли всі поля заповнено.
+    """
+    elapsed = 0.0
+    last_err = None
+    while elapsed < timeout_s:
+        result = await _frame_click_by_text(frame, needle)
+        if result:
+            return result
+        await asyncio.sleep(1)
+        elapsed += 1
+    log.warning("_wait_and_click: %r not enabled after %ss", needle, timeout_s)
+    return None
 
 
 async def _frame_click_by_text(frame: Frame, needle: str) -> dict | None:
@@ -572,6 +576,114 @@ async def _frame_pick_dropdown_option(frame: Frame, value: str):
         )
     except Exception:
         log.exception("dropdown pick failed for %r", value)
+
+
+async def _frame_add_sku_images_multiselect(frame: Frame, page: Page, col_names: list[str]):
+    """Multi-select combobox для VTEX SKU Images target field.
+
+    Структура (з реального UI):
+      [Label: "SKU Images"]   [combobox з вже-обраними chips + input + ▾]
+                              ⇣ open
+                              ┌─ "SKU Plain Image"
+                              ├─ "SKU Images 3"
+                              ├─ "SKU Images 4"
+                              ├─ ... (option list)
+
+    Стратегія: знаходимо label "SKU Images", знаходимо найближчий combobox
+    праворуч, відкриваємо dropdown 1 раз, далі по черзі клікаємо options.
+    """
+    # 1. Open dropdown — клік на сам combobox/chevron (поруч з label "SKU Images")
+    opened = await frame.evaluate(
+        """
+        () => {
+            // Знаходимо label з ТОЧНИМ текстом "SKU Images" (не SKU Images 3 etc)
+            const all = [...document.querySelectorAll('label, span, div, p')];
+            const label = all.find(el => (el.innerText || '').trim() === 'SKU Images');
+            if (!label) return {error: 'no_label', samples: all.slice(0,5).map(e => (e.innerText||'').trim().slice(0,30))};
+
+            // Знаходимо найближчий controls-контейнер. Зазвичай parent — це
+            // <tr> або flex-row з label зліва і control справа.
+            const row = label.closest('tr, div[class*="row" i], div[class*="Row" i], li, fieldset')
+                       || label.parentElement;
+            // Combobox зазвичай має role=combobox АБО input всередині wrapper
+            const combo = row?.querySelector('[role="combobox"]')
+                       || row?.querySelector('input[type="text"]')
+                       || row?.querySelector('button');
+            if (!combo) return {error: 'no_combobox', row_class: row?.className};
+            combo.scrollIntoView({block: 'center'});
+            combo.click();
+            // Дізнаємось що саме клікнули
+            return {clicked: combo.tagName, role: combo.getAttribute('role'), cls: combo.className?.toString().slice(0,80)};
+        }
+        """
+    )
+    log.info("SKU Images combobox open: %s", opened)
+    if opened.get("error"):
+        log.warning("Could not open SKU Images combobox: %s", opened)
+        return
+    await page.wait_for_timeout(800)
+
+    # 2. По черзі клікаємо кожну опцію за text-content. У multi-select VTEX
+    # dropdown часто закривається після кожного click, тому повторно відкриваємо.
+    for col in col_names:
+        # Знаходимо опцію за точним text-match
+        result = await frame.evaluate(
+            """
+            (col) => {
+                // Шукаємо у відкритому dropdown
+                const options = [...document.querySelectorAll('[role="option"], [role="listbox"] *, li')];
+                const found = options.find(el => {
+                    const t = (el.innerText || '').trim();
+                    return t === col;
+                });
+                if (!found) return {error: 'no_option', col};
+                found.scrollIntoView({block: 'center'});
+                found.click();
+                return {clicked: col, tag: found.tagName, role: found.getAttribute('role')};
+            }
+            """,
+            col,
+        )
+        if result.get("error"):
+            log.warning("Option not found: %s — спробую переоткрити dropdown", result)
+            # Re-open dropdown via Tab/click if closed
+            await frame.evaluate(
+                """
+                () => {
+                    const all = [...document.querySelectorAll('label, span, div, p')];
+                    const label = all.find(el => (el.innerText || '').trim() === 'SKU Images');
+                    if (!label) return null;
+                    const row = label.closest('tr, div[class*="row" i], li, fieldset') || label.parentElement;
+                    const combo = row?.querySelector('[role="combobox"]') || row?.querySelector('input[type="text"]');
+                    if (combo) { combo.click(); return true; }
+                    return false;
+                }
+                """
+            )
+            await page.wait_for_timeout(500)
+            # Retry once
+            result = await frame.evaluate(
+                """
+                (col) => {
+                    const options = [...document.querySelectorAll('[role="option"], li')];
+                    const found = options.find(el => (el.innerText || '').trim() === col);
+                    if (found) { found.scrollIntoView({block: 'center'}); found.click(); return {clicked: col, retry: true}; }
+                    return {error: 'no_option_after_retry', col};
+                }
+                """,
+                col,
+            )
+            if result.get("error"):
+                log.warning("Failed to add %s: %s", col, result)
+                continue
+        log.info("Added SKU Images mapping: %s — %s", col, result)
+        await page.wait_for_timeout(400)
+
+    # 3. Закриваємо dropdown (ESC) щоб не блокувати наступні кліки
+    try:
+        await page.keyboard.press("Escape")
+    except Exception:
+        pass
 
 
 async def _frame_add_sku_image_mapping(frame: Frame, col_name: str):
