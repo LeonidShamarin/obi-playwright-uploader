@@ -579,64 +579,101 @@ async def _frame_pick_dropdown_option(frame: Frame, value: str):
 
 
 async def _frame_add_sku_images_multiselect(frame: Frame, page: Page, col_names: list[str]):
-    """Multi-select combobox для VTEX SKU Images target field.
+    """VTEX SKU Images dropdown — open для КОЖНОЇ опції окремо.
 
-    Структура (з реального UI):
-      [Label: "SKU Images"]   [combobox з вже-обраними chips + input + ▾]
-                              ⇣ open
-                              ┌─ "SKU Plain Image"
-                              ├─ "SKU Images 3"
-                              ├─ "SKU Images 4"
-                              ├─ ... (option list)
+    Користувач підтвердив поведінку: dropdown ЗАКРИВАЄТЬСЯ після кожного
+    select. Тобто треба:
+      1. Click dropdown trigger
+      2. Click option N
+      3. Click dropdown trigger знову
+      4. Click option N+1
+      ... etc
 
-    Стратегія: знаходимо label "SKU Images", знаходимо найближчий combobox
-    праворуч, відкриваємо dropdown 1 раз, далі по черзі клікаємо options.
+    Тригер — combobox/input/button поруч з label "SKU Images". Шукаємо
+    walking up DOM tree (label.parentElement, parent.parentElement, ...).
     """
-    # 1. Open dropdown — клік на сам combobox/chevron (поруч з label "SKU Images")
-    opened = await frame.evaluate(
+    # JS-функція що знаходить trigger елемент (без click) — для diagnostic
+    diagnostic = await frame.evaluate(
         """
         () => {
-            // Знаходимо label з ТОЧНИМ текстом "SKU Images" (не SKU Images 3 etc)
             const all = [...document.querySelectorAll('label, span, div, p')];
             const label = all.find(el => (el.innerText || '').trim() === 'SKU Images');
-            if (!label) return {error: 'no_label', samples: all.slice(0,5).map(e => (e.innerText||'').trim().slice(0,30))};
-
-            // Знаходимо найближчий controls-контейнер. Зазвичай parent — це
-            // <tr> або flex-row з label зліва і control справа.
-            const row = label.closest('tr, div[class*="row" i], div[class*="Row" i], li, fieldset')
-                       || label.parentElement;
-            // Combobox зазвичай має role=combobox АБО input всередині wrapper
-            const combo = row?.querySelector('[role="combobox"]')
-                       || row?.querySelector('input[type="text"]')
-                       || row?.querySelector('button');
-            if (!combo) return {error: 'no_combobox', row_class: row?.className};
-            combo.scrollIntoView({block: 'center'});
-            combo.click();
-            // Дізнаємось що саме клікнули
-            return {clicked: combo.tagName, role: combo.getAttribute('role'), cls: combo.className?.toString().slice(0,80)};
+            if (!label) return {error: 'no_label'};
+            // Walk up to 6 ancestors looking for a control
+            let scope = label.parentElement;
+            for (let i = 0; i < 6 && scope; i++) {
+                const trigger = scope.querySelector(
+                    '[role="combobox"], input:not([type="hidden"]):not([type="file"]), button[aria-haspopup], [aria-expanded]'
+                );
+                if (trigger && trigger !== label) {
+                    return {
+                        ancestor_level: i,
+                        ancestor_tag: scope.tagName,
+                        ancestor_class: scope.className?.toString().slice(0,80),
+                        trigger_tag: trigger.tagName,
+                        trigger_role: trigger.getAttribute('role'),
+                        trigger_aria: trigger.getAttribute('aria-haspopup'),
+                        trigger_class: trigger.className?.toString().slice(0,80),
+                    };
+                }
+                scope = scope.parentElement;
+            }
+            return {error: 'no_trigger_in_6_ancestors'};
         }
         """
     )
-    log.info("SKU Images combobox open: %s", opened)
-    if opened.get("error"):
-        log.warning("Could not open SKU Images combobox: %s", opened)
+    log.info("SKU Images trigger diagnostic: %s", diagnostic)
+    if diagnostic.get("error"):
+        log.warning("Cannot find SKU Images dropdown trigger: %s", diagnostic)
         return
-    await page.wait_for_timeout(800)
 
-    # 2. По черзі клікаємо кожну опцію за text-content. У multi-select VTEX
-    # dropdown часто закривається після кожного click, тому повторно відкриваємо.
+    # Окрема JS-функція що відкриває dropdown — кличеться перед кожною опцією.
+    OPEN_JS = """
+        () => {
+            const all = [...document.querySelectorAll('label, span, div, p')];
+            const label = all.find(el => (el.innerText || '').trim() === 'SKU Images');
+            if (!label) return {error: 'no_label'};
+            let scope = label.parentElement;
+            for (let i = 0; i < 6 && scope; i++) {
+                const trigger = scope.querySelector(
+                    '[role="combobox"], input:not([type="hidden"]):not([type="file"]), button[aria-haspopup], [aria-expanded]'
+                );
+                if (trigger && trigger !== label) {
+                    trigger.scrollIntoView({block: 'center'});
+                    trigger.focus();
+                    trigger.click();
+                    return {opened: true, tag: trigger.tagName};
+                }
+                scope = scope.parentElement;
+            }
+            return {error: 'no_trigger'};
+        }
+    """
+
     for col in col_names:
-        # Знаходимо опцію за точним text-match
+        # 1. Open dropdown
+        opened = await frame.evaluate(OPEN_JS)
+        if opened.get("error"):
+            log.warning("Failed to re-open dropdown for %s: %s", col, opened)
+            continue
+        await page.wait_for_timeout(600)
+
+        # 2. Click option — exact text-match
         result = await frame.evaluate(
             """
             (col) => {
-                // Шукаємо у відкритому dropdown
-                const options = [...document.querySelectorAll('[role="option"], [role="listbox"] *, li')];
-                const found = options.find(el => {
-                    const t = (el.innerText || '').trim();
-                    return t === col;
-                });
-                if (!found) return {error: 'no_option', col};
+                const options = [...document.querySelectorAll('[role="option"], li, [data-value]')];
+                let found = options.find(el => (el.innerText || '').trim() === col);
+                if (!found) {
+                    // Lenient: trim + match start (handle hidden chevron suffix)
+                    found = options.find(el => {
+                        const t = (el.innerText || '').trim();
+                        return t === col || t.startsWith(col);
+                    });
+                }
+                if (!found) {
+                    return {error: 'no_option', col, sample_options: options.slice(0,15).map(o => (o.innerText||'').trim().slice(0,40))};
+                }
                 found.scrollIntoView({block: 'center'});
                 found.click();
                 return {clicked: col, tag: found.tagName, role: found.getAttribute('role')};
@@ -645,41 +682,12 @@ async def _frame_add_sku_images_multiselect(frame: Frame, page: Page, col_names:
             col,
         )
         if result.get("error"):
-            log.warning("Option not found: %s — спробую переоткрити dropdown", result)
-            # Re-open dropdown via Tab/click if closed
-            await frame.evaluate(
-                """
-                () => {
-                    const all = [...document.querySelectorAll('label, span, div, p')];
-                    const label = all.find(el => (el.innerText || '').trim() === 'SKU Images');
-                    if (!label) return null;
-                    const row = label.closest('tr, div[class*="row" i], li, fieldset') || label.parentElement;
-                    const combo = row?.querySelector('[role="combobox"]') || row?.querySelector('input[type="text"]');
-                    if (combo) { combo.click(); return true; }
-                    return false;
-                }
-                """
-            )
-            await page.wait_for_timeout(500)
-            # Retry once
-            result = await frame.evaluate(
-                """
-                (col) => {
-                    const options = [...document.querySelectorAll('[role="option"], li')];
-                    const found = options.find(el => (el.innerText || '').trim() === col);
-                    if (found) { found.scrollIntoView({block: 'center'}); found.click(); return {clicked: col, retry: true}; }
-                    return {error: 'no_option_after_retry', col};
-                }
-                """,
-                col,
-            )
-            if result.get("error"):
-                log.warning("Failed to add %s: %s", col, result)
-                continue
-        log.info("Added SKU Images mapping: %s — %s", col, result)
-        await page.wait_for_timeout(400)
+            log.warning("Option not found for %s: %s", col, result)
+        else:
+            log.info("Added SKU Images mapping: %s", col)
+        await page.wait_for_timeout(500)
 
-    # 3. Закриваємо dropdown (ESC) щоб не блокувати наступні кліки
+    # Закриваємо останній dropdown (ESC) щоб не блокувати Weiter-клік
     try:
         await page.keyboard.press("Escape")
     except Exception:
