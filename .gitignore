@@ -1,0 +1,27 @@
+# Secrets — НІКОЛИ не комітити
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+
+# Playwright artifacts
+storage_state.json
+/tmp/
+screenshots/
+downloads/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

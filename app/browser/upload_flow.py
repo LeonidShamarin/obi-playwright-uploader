@@ -1,0 +1,228 @@
+"""
+Upload-flow VTEX seller cabinet:
+  Produkte → Produktimport → +Neuimport →
+  Jobname → Kategorie wählen → upload xlsx → Mapping (SKU Images 3..10) →
+  Nächster → polling status → if errors → download Fehlerbericht.
+"""
+import asyncio
+import logging
+import re
+from datetime import datetime
+from pathlib import Path
+
+from playwright.async_api import Page, TimeoutError as PlaywrightTimeout
+
+from app.settings import settings
+
+log = logging.getLogger("browser.upload_flow")
+
+PRODUKTIMPORT_URL = "https://hajus679.myvtex.com/admin/products/Produktimport"
+SKU_IMAGE_COLUMNS_TO_MAP = [f"SKU Images {i}" for i in range(3, 11)]  # 3..10
+STATUS_TERMINAL = {"completed", "failed"}
+STATUS_POLL_INTERVAL = 10  # seconds
+STATUS_POLL_MAX_TRIES = 90  # 15 хвилин на імпорт
+
+
+async def upload_xlsx_to_obi(
+    page: Page, xlsx_bytes: bytes, jobname: str, category: str | None = None,
+) -> dict:
+    """
+    Виконує повний upload-flow і повертає JSON-звіт:
+      {
+        "status": "completed" | "failed" | "timeout",
+        "jobname": str,
+        "totals": {imported, failed, skipped, total},
+        "fehlerbericht_xlsx_b64": str | None,
+        "screenshots": [path1, path2, ...]
+      }
+    """
+    screenshots = []
+    category = category or settings.obi_default_category
+
+    log.info("Navigating to %s", PRODUKTIMPORT_URL)
+    await page.goto(PRODUKTIMPORT_URL, wait_until="networkidle")
+
+    # +Neuimport
+    new_btn = page.get_by_role("button", name=re.compile(r"\+\s*Neuimport|new\s*import", re.I))
+    await new_btn.first.click()
+    await page.wait_for_load_state("networkidle")
+    screenshots.append(await _shot(page, "01_neuimport_open"))
+
+    # Jobname
+    jobname_input = page.locator('input[name*="job" i], input[id*="job" i]').first
+    if await jobname_input.count():
+        await jobname_input.fill(jobname)
+
+    # Kategorie wählen
+    cat_btn = page.get_by_role("button", name=re.compile(r"Kategorie\s*wählen", re.I))
+    if await cat_btn.count():
+        await cat_btn.first.click()
+        # Шукаємо категорію в dropdown / search
+        await asyncio.sleep(1)
+        search = page.locator('input[type="search"], input[placeholder*="Suchen" i]').first
+        if await search.count():
+            await search.fill(category)
+            await asyncio.sleep(1)
+        # Вибираємо першу пропозицію
+        first_option = page.locator('[role="option"], li[data-value]').first
+        if await first_option.count():
+            await first_option.click()
+        screenshots.append(await _shot(page, "02_category_picked"))
+
+    # Datei hochladen
+    file_input = page.locator('input[type="file"]').first
+    await file_input.set_input_files(
+        files=[{"name": f"{jobname}.xlsx", "mimeType":
+               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "buffer": xlsx_bytes}]
+    )
+    await page.wait_for_load_state("networkidle")
+    screenshots.append(await _shot(page, "03_file_uploaded"))
+
+    # Nächster Schritt → Mapping
+    next_btn = page.get_by_role("button", name=re.compile(r"Nächster|Next|Weiter", re.I))
+    await next_btn.first.click()
+    await page.wait_for_load_state("networkidle")
+    screenshots.append(await _shot(page, "04_mapping_open"))
+
+    # Mapping: розкрити Product Content і додати SKU Images 3..10
+    await _expand_product_content(page)
+    for col in SKU_IMAGE_COLUMNS_TO_MAP:
+        await _add_image_mapping(page, col)
+    screenshots.append(await _shot(page, "05_mapping_done"))
+
+    # Next → запуск імпорту
+    next_btn2 = page.get_by_role("button", name=re.compile(r"Nächster|Next|Weiter", re.I))
+    await next_btn2.first.click()
+    await page.wait_for_load_state("networkidle")
+    screenshots.append(await _shot(page, "06_import_started"))
+
+    # Polling статусу
+    final_status, totals = await _poll_status(page)
+    screenshots.append(await _shot(page, "07_final_status"))
+
+    fehler_b64 = None
+    if final_status == "failed" or (totals and totals.get("failed", 0) > 0):
+        fehler_b64 = await _download_fehlerbericht(page)
+
+    return {
+        "status": final_status,
+        "jobname": jobname,
+        "category": category,
+        "totals": totals,
+        "fehlerbericht_xlsx_b64": fehler_b64,
+        "screenshots": screenshots,
+    }
+
+
+async def _shot(page: Page, label: str) -> str:
+    name = f"{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}_{label}.png"
+    path = Path(settings.screenshot_dir) / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        await page.screenshot(path=str(path), full_page=True)
+    except Exception:
+        log.exception("Failed to take screenshot %s", name)
+    return str(path)
+
+
+async def _expand_product_content(page: Page) -> None:
+    """Розкриває секцію Product Content на mapping-екрані."""
+    section = page.get_by_text("Product Content", exact=False).first
+    try:
+        await section.click()
+        await asyncio.sleep(0.5)
+    except Exception:
+        log.warning("Could not click Product Content section")
+
+
+async def _add_image_mapping(page: Page, col_name: str) -> None:
+    """Знаходить SKU Images dropdown, додає вказаний column."""
+    sku_images_field = page.locator('text="SKU Images"').first
+    try:
+        # Клік по полю dropdown щоб відкрити
+        await sku_images_field.click()
+    except Exception:
+        log.warning("SKU Images field not found")
+        return
+
+    # Шукаємо поле пошуку у відкритому dropdown
+    search = page.locator('input[type="search"], input[placeholder*="search" i]').first
+    if await search.count():
+        await search.fill(col_name)
+        await asyncio.sleep(0.7)
+
+    option = page.locator(f'[role="option"]:has-text("{col_name}")').first
+    if await option.count():
+        await option.click()
+        log.info("Mapped column %s", col_name)
+    else:
+        log.warning("Column %s not found in mapping dropdown", col_name)
+    await asyncio.sleep(0.5)
+
+
+async def _poll_status(page: Page) -> tuple[str, dict | None]:
+    """
+    Чекає, поки статус імпорту стане completed/failed.
+    Повертає (status, totals_dict).
+    """
+    for attempt in range(STATUS_POLL_MAX_TRIES):
+        try:
+            status_text = (
+                await page.locator(
+                    'text=/preflight|new|completed|failed/i'
+                ).first.text_content(timeout=2000)
+            )
+        except PlaywrightTimeout:
+            status_text = ""
+        s = (status_text or "").strip().lower()
+        log.info("Import status (attempt %d/%d): %r", attempt + 1, STATUS_POLL_MAX_TRIES, s)
+
+        if "completed" in s:
+            return "completed", await _read_totals(page)
+        if "failed" in s:
+            return "failed", await _read_totals(page)
+        await asyncio.sleep(STATUS_POLL_INTERVAL)
+        try:
+            await page.reload(wait_until="domcontentloaded")
+        except Exception:
+            log.exception("Reload during polling failed")
+    return "timeout", None
+
+
+async def _read_totals(page: Page) -> dict:
+    """Витягає Gesamtanzahl/Importierte/Fehlgeschlagene/Übersprungene з UI."""
+    out = {}
+    for label, key in (
+        ("Gesamtanzahl", "total"),
+        ("Importierte", "imported"),
+        ("Fehlgeschlagene", "failed"),
+        ("Übersprungene", "skipped"),
+    ):
+        try:
+            el = page.locator(f'text=/{label}/i').first
+            if await el.count():
+                surrounding = await el.evaluate("el => el.closest('div').innerText")
+                m = re.search(r"\d+", surrounding or "")
+                if m:
+                    out[key] = int(m.group(0))
+        except Exception:
+            log.exception("Failed to read %s", label)
+    return out
+
+
+async def _download_fehlerbericht(page: Page) -> str | None:
+    """Кліком на Fehlerbericht XLSX/CSV завантажує файл і повертає base64."""
+    import base64
+
+    btn = page.get_by_role("link", name=re.compile(r"Fehlerbericht.*XLSX|Fehlerbericht", re.I))
+    if not await btn.count():
+        log.warning("Fehlerbericht link not found")
+        return None
+    async with page.expect_download() as dl_info:
+        await btn.first.click()
+    download = await dl_info.value
+    save_path = Path(settings.download_dir) / download.suggested_filename
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    await download.save_as(str(save_path))
+    return base64.b64encode(save_path.read_bytes()).decode("ascii")
