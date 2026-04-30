@@ -130,6 +130,49 @@ async def upload_xlsx_to_obi(
         elapsed += 2
 
     if new_btn is None:
+        # Спочатку — чи є iframe(s) на сторінці? VTEX часто використовує legacy iframes.
+        iframes_info = await page.evaluate("""
+            () => Array.from(document.querySelectorAll('iframe')).map(f => ({
+                src: f.src, id: f.id, name: f.name, title: f.title,
+                width: f.clientWidth, height: f.clientHeight,
+            }))
+        """)
+        log.info("iframes on page: %s", iframes_info)
+
+        # Якщо є iframe — пробуємо знайти кнопку всередині кожного frame
+        if iframes_info:
+            for frame in page.frames:
+                if frame == page.main_frame:
+                    continue
+                log.info("Checking frame: url=%s name=%r", frame.url, frame.name)
+                try:
+                    in_frame = await frame.evaluate("""
+                        () => {
+                            const targets = [...document.querySelectorAll('button, a, [role="button"]')];
+                            const found = targets.find(el =>
+                                (el.innerText || '').toLowerCase().includes('neuer import')
+                                || (el.getAttribute('aria-label') || '').toLowerCase().includes('neuer import')
+                            );
+                            if (found) {
+                                found.scrollIntoView({block: 'center'});
+                                found.click();
+                                return {tag: found.tagName, text: (found.innerText || '').trim().slice(0, 60)};
+                            }
+                            return null;
+                        }
+                    """)
+                    if in_frame:
+                        log.info("Clicked Neuer Import inside frame: %s", in_frame)
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=20000)
+                        except Exception:
+                            pass
+                        screenshots.append(await _shot(page, "01_neuimport_open"))
+                        new_btn = "JS_CLICKED_VIA_FRAME"  # позначаємо, що клік стався
+                        break
+                except Exception:
+                    log.exception("Frame click attempt failed")
+
         # Diagnostic: подивимось всі кнопки і посилання на сторінці
         try:
             elements_info = await page.evaluate("""
@@ -153,9 +196,10 @@ async def upload_xlsx_to_obi(
         except Exception:
             log.exception("Failed to enumerate page elements")
 
-        # Спроба JS-click через innerText match
-        log.info("Trying JS click via innerText match...")
-        clicked_via_js = await page.evaluate("""
+        # Спроба JS-click через innerText match (на main frame)
+        if new_btn is None:
+            log.info("Trying JS click via innerText match (main frame)...")
+        clicked_via_js = None if new_btn is not None else await page.evaluate("""
             () => {
                 const targets = [...document.querySelectorAll('button, a, [role="button"]')];
                 const found = targets.find(el =>
