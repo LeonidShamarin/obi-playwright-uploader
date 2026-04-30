@@ -638,21 +638,39 @@ async def _frame_add_sku_images_multiselect(frame: Frame, page: Page, col_names:
 
     log.info("SKU Images combobox handle obtained")
 
+    # ElementHandle → Locator для зручного fill() API
+    el_locator = frame.locator('input[role="combobox"]').filter(has_text="").first
+    # Wrap raw handle as locator альтернативно — використовуємо el напряму
     for col in col_names:
         try:
-            # Click combobox → focus + open dropdown. БЕЗ Ctrl+A —
-            # бо у multi-select combobox це могло б видалити вже-додані
-            # chips (попередні mapped image columns).
+            # Focus input + open dropdown
             await el.scroll_into_view_if_needed()
             await el.click()
-            await page.wait_for_timeout(500)
-            # Type col name (filters dropdown options)
-            await page.keyboard.type(col, delay=40)
-            await page.wait_for_timeout(800)
-            # Enter selects the highlighted (top filtered) option → стає chip
-            await page.keyboard.press("Enter")
+            await page.wait_for_timeout(400)
+            # Fill через native ElementHandle — clears + types new text.
+            # Це впливає лише на search input, chips незмінні.
+            await el.fill(col)
+            await page.wait_for_timeout(700)
+            # Клікаємо ВИДИМУ опцію з точним text-match через Playwright
+            # get_by_text — auto-wait + правильний user click event.
+            clicked = False
+            try:
+                opt = frame.get_by_text(col, exact=True)
+                cnt = await opt.count()
+                for idx in range(min(cnt, 5)):
+                    cand = opt.nth(idx)
+                    if await cand.is_visible(timeout=300):
+                        await cand.click(timeout=2000)
+                        clicked = True
+                        log.info("Added SKU Images mapping (click): %s", col)
+                        break
+            except Exception:
+                pass
+            # Fallback: Enter (selects highlighted top-match)
+            if not clicked:
+                await page.keyboard.press("Enter")
+                log.info("Added SKU Images mapping (Enter): %s", col)
             await page.wait_for_timeout(600)
-            log.info("Typed+Enter for SKU Images mapping: %s", col)
         except Exception as e:
             log.exception("Failed to add %s: %s", col, e)
 
