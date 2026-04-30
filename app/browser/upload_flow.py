@@ -99,9 +99,15 @@ async def upload_xlsx_to_obi(
     new_btn = None
     new_import_re = re.compile(r"Neuer\s+Import|Neuimport|New\s+Import", re.I)
     candidate_factories = [
-        ('role:button name~="Neuer Import"', lambda: page.get_by_role("button", name=new_import_re)),
-        ('role:link name~="Neuer Import"',   lambda: page.get_by_role("link",   name=new_import_re)),
-        ('text=Neuer Import',                lambda: page.get_by_text(new_import_re)),
+        # CSS-селектори з :has-text (найнадійніше для VTEX UI)
+        ('css button:has-text("Neuer Import")', lambda: page.locator('button:has-text("Neuer Import")')),
+        ('css a:has-text("Neuer Import")',      lambda: page.locator('a:has-text("Neuer Import")')),
+        ('css [role=button]:has-text("Neuer Import")', lambda: page.locator('[role="button"]:has-text("Neuer Import")')),
+        ('css button:has-text("Neuer")',        lambda: page.locator('button:has-text("Neuer")')),
+        # Fallback на role-based
+        ('role:button name=re Neuer Import', lambda: page.get_by_role("button", name=new_import_re)),
+        ('role:link name=re Neuer Import',   lambda: page.get_by_role("link",   name=new_import_re)),
+        ('text Neuer Import',                lambda: page.get_by_text(new_import_re)),
     ]
     log.info("Polling до 25s для Neuer-Import button...")
     elapsed = 0.0
