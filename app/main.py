@@ -59,6 +59,45 @@ def health() -> dict:
     return {"ok": True, "service": "obi-playwright-uploader", "version": "0.1.0"}
 
 
+@app.post("/storage-state", dependencies=[Depends(require_bearer)])
+def upload_storage_state(state: dict) -> dict:
+    """Записує переданий Playwright storage_state у persistent path."""
+    import json as _json
+    from pathlib import Path
+    if not isinstance(state, dict) or "cookies" not in state:
+        raise HTTPException(status_code=400, detail="Expected dict with 'cookies' key")
+    path = Path(settings.storage_state_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "ok": True,
+        "path": str(path),
+        "cookies_count": len(state.get("cookies") or []),
+        "origins_count": len(state.get("origins") or []),
+    }
+
+
+@app.get("/storage-state-info", dependencies=[Depends(require_bearer)])
+def storage_state_info() -> dict:
+    """Чи існує storage_state.json і коли востаннє записаний."""
+    from pathlib import Path
+    path = Path(settings.storage_state_path)
+    if not path.exists():
+        return {"exists": False, "path": str(path)}
+    import json as _json
+    try:
+        data = _json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"exists": True, "path": str(path), "error": f"parse: {e}"}
+    return {
+        "exists": True,
+        "path": str(path),
+        "size_bytes": path.stat().st_size,
+        "cookies_count": len(data.get("cookies") or []),
+        "origins_count": len(data.get("origins") or []),
+    }
+
+
 @app.get("/screenshots", dependencies=[Depends(require_bearer)])
 def list_screenshots() -> dict:
     """Список доступних скріншотів."""
