@@ -271,19 +271,20 @@ async def upload_xlsx_to_obi(
         raise RuntimeError("Could not click Weiter after file upload (button stayed disabled)")
     log.info("Clicked Weiter Step 1 → 2: %s", next_clicked)
 
-    # VTEX показує "Wir bearbeiten Ihre Datei. Das kann eine Weile dauern."
-    # placeholder поки парсить xlsx. Треба чекати поки mapping fields
-    # зрендеряться (до 90s — для великих файлів).
+    # VTEX показує "Wir bearbeiten Ihre Datei" placeholder поки парсить xlsx.
+    # Треба дочекатися поки фактичні mapping fields з'являться. Найбільш
+    # специфічна ознака — текст "SKU Images" (label поля з нашими image
+    # mappings) АБО "Product Content" (header секції що його містить).
     app_frame = await _wait_for_app_frame(page, timeout_s=10)
-    log.info("Waiting for mapping fields (Schritt 2 processing)...")
+    log.info("Waiting for mapping page render (looking for 'Product Content' or 'SKU Images')...")
     try:
         await app_frame.get_by_text(
-            re.compile(r"Marketplace-Attribut|Product Information|Zuordnung", re.I)
-        ).first.wait_for(state="visible", timeout=90000)
+            re.compile(r"^Product Content$|^SKU Images$|^SKU Main Image", re.I)
+        ).first.wait_for(state="visible", timeout=120000)
         log.info("Mapping fields rendered")
     except Exception as e:
         log.warning("Mapping fields wait timeout: %s", e)
-    await page.wait_for_timeout(1500)
+    await page.wait_for_timeout(2000)
     screenshots.append(await _shot(page, "07_mapping_page"))
 
     # ── 8. Mapping: add SKU Images 3..10 у multi-select combobox ────────────
