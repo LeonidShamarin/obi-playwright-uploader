@@ -90,15 +90,15 @@ async def upload_xlsx_to_obi(
             f"Could not click 'Neuer Import' in any frame. Frames: {all_frames}"
         )
     log.info("Clicked 'Neuer Import' in frame %s: %s", clicked.get("frame_url"), clicked)
-    # Modal може відкритись у тому ж frame, без navigation. Просто чекаємо рендер.
-    await page.wait_for_timeout(3000)
+    # Дамо більше часу — VTEX іноді повільно піднімає new-import iframe.
+    await page.wait_for_timeout(5000)
     try:
-        await page.wait_for_load_state("networkidle", timeout=15000)
+        await page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
         pass
-    # Перевіряємо: чи є frame з new-import (якщо modal це окремий iframe), інакше залишаємось на target_frame
+    # Чекаємо до 25s на frame з new-import
     try:
-        app_frame = await _wait_for_app_frame(page, timeout_s=5, url_must_contain="new-import")
+        app_frame = await _wait_for_app_frame(page, timeout_s=25, url_must_contain="new-import")
         log.info("Found new-import sub-frame: %s", app_frame.url)
     except RuntimeError:
         app_frame = target_frame
