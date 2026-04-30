@@ -40,11 +40,45 @@ async def upload_xlsx_to_obi(
     category = category or settings.obi_default_category
 
     log.info("Navigating to %s", PRODUKTIMPORT_URL)
-    await page.goto(PRODUKTIMPORT_URL, wait_until="networkidle")
+    await page.goto(PRODUKTIMPORT_URL, wait_until="domcontentloaded")
+    # Дамо React/SPA дорендеритись
+    await page.wait_for_timeout(3000)
+    screenshots.append(await _shot(page, "00_produktimport_loaded"))
 
-    # +Neuimport
-    new_btn = page.get_by_role("button", name=re.compile(r"\+\s*Neuimport|new\s*import", re.I))
-    await new_btn.first.click()
+    # Шукаємо кнопку +Neuimport кількома способами (роль кнопки/посилання, ширші селектори)
+    new_btn = None
+    candidates = [
+        ('role:button name="+Neuimport"', lambda: page.get_by_role("button", name=re.compile(r"\+\s*Neuimport", re.I))),
+        ('role:button name="Neuimport"',  lambda: page.get_by_role("button", name=re.compile(r"Neuimport", re.I))),
+        ('role:button name="New import"', lambda: page.get_by_role("button", name=re.compile(r"new\s*import", re.I))),
+        ('role:link name="Neuimport"',    lambda: page.get_by_role("link",   name=re.compile(r"Neuimport", re.I))),
+        ('text=+Neuimport',                lambda: page.get_by_text(re.compile(r"\+\s*Neuimport", re.I))),
+        ('text=Neuimport',                 lambda: page.get_by_text(re.compile(r"Neuimport", re.I))),
+    ]
+    for label, factory in candidates:
+        loc = factory()
+        try:
+            count = await loc.count()
+            if count:
+                log.info("Neuimport candidate %r matched %d elements", label, count)
+                new_btn = loc.first
+                break
+        except Exception as exc:
+            log.warning("Neuimport candidate %r failed: %s", label, exc)
+
+    if new_btn is None:
+        screenshots.append(await _shot(page, "ERR_neuimport_not_found"))
+        raise RuntimeError(
+            f"+Neuimport button not found on Produktimport page (URL: {page.url}). "
+            "Перевір screenshots/00_produktimport_loaded.png і ERR_neuimport_not_found.png"
+        )
+
+    try:
+        await new_btn.click(timeout=15000)
+    except Exception:
+        screenshots.append(await _shot(page, "ERR_neuimport_click_failed"))
+        raise
+
     await page.wait_for_load_state("networkidle")
     screenshots.append(await _shot(page, "01_neuimport_open"))
 
