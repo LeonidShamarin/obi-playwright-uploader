@@ -125,6 +125,17 @@ async def upload_xlsx_to_obi(
         raise RuntimeError(
             f"Could not click 'Neuer Import' in any frame. Frames: {all_frames}"
         )
+
+    # Чекаємо до 15s поки форма зрендериться (jobname input з'явиться).
+    # Без цієї паузи буває race: frame знайдено, але React ще не змонтував UI.
+    try:
+        await app_frame.locator('input[name="jobName"]').first.wait_for(
+            state="visible", timeout=15000
+        )
+        log.info("Form rendered (jobName input visible)")
+    except Exception:
+        log.warning("jobName input did not appear in 15s — продовжуємо спекулятивно")
+
     screenshots.append(await _shot(page, "02_neuimport_form"))
 
     # ── 4. Fill Jobname ─────────────────────────────────────────────────────
@@ -413,9 +424,9 @@ async def _try_click_in_any_frame(page: Page, needle: str) -> tuple[Frame | None
 async def _frame_click_by_text(frame: Frame, needle: str) -> dict | None:
     """Клік на button/link з accessible name = needle.
 
-    Приоритет:
-      1. Playwright get_by_role("button"|"link", name=regex) → реальний user-event
-      2. JS fallback з фільтром visibility (відкидаємо hidden buttons)
+    Пропускає disabled-кандидатів (бо force-click disabled-кнопки нічого
+    не робить, тільки маскує невирішену помилку — попереднім кроком форма
+    не була повністю заповнена).
     """
     pat = re.compile(re.escape(needle), re.I)
     # 1. Playwright role-based locator (real user click events)
@@ -431,8 +442,13 @@ async def _frame_click_by_text(frame: Frame, needle: str) -> dict | None:
                     box = await cand.bounding_box()
                     if not box or box.get("width", 0) < 5 or box.get("height", 0) < 5:
                         continue
+                    # Skip disabled — інакше force-click "успішний" але noop
+                    if await cand.is_disabled():
+                        continue
+                    if (await cand.get_attribute("aria-disabled")) == "true":
+                        continue
                     await cand.scroll_into_view_if_needed(timeout=2000)
-                    await cand.click(force=True, timeout=5000)
+                    await cand.click(timeout=5000)  # БЕЗ force — натуральний клік
                     name = (await cand.text_content()) or await cand.get_attribute("aria-label") or ""
                     return {
                         "tag": role.upper(),
