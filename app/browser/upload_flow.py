@@ -714,26 +714,33 @@ async def _frame_add_sku_images_multiselect(frame: Frame, page: Page, col_names:
 
 
 async def _frame_resolve_attribute_mappings(
-    frame: Frame, page: Page, max_iters: int = 80
+    frame: Frame, page: Page, max_iters: int = 100
 ) -> list[dict]:
     """Авто-резолв dictionary-mapping dropdowns на Schritt 2/3.
 
-    UI patterns: рядок з "<Label>*" + input (pre-filled з best-guess) +
-    "Skip" button + chevron-кнопкою для відкриття dropdown.
+    UI patterns: рядок з "<Label>*" (source value, lowercase) + input +
+    "Skip" button + chevron-dropdown. Опції — type-to-search combobox:
+    options НЕ рендеряться у DOM поки користувач не введе текст у input.
 
     Стратегія per row:
-      1. Click chevron → dropdown відкривається з canonical-options
-      2. Pick exact-match (case-insensitive) до label OR input value
-      3. Else pick перший наявний з NEUTRAL_ATTRIBUTE_FALLBACKS
-      4. Else fallback на першу опцію (VTEX-pre-sorted by relevance)
+      1. Знайти input + chevron у рядку з "Skip" кнопкою
+      2. Focus input → set value до source-label (це trigger-ить VTEX search)
+      3. Click chevron щоб дропдаун відкрився
+      4. Wait + read [role=option]
+      5. Pick exact-match case-insensitive (label vs option text)
+      6. Else pick з NEUTRAL_ATTRIBUTE_FALLBACKS
+      7. Else fallback на першу опцію
+      8. Якщо опцій 0 навіть після typing — Skip-клік, рухаємось далі
 
-    Повертає список resolved-rows для логу/звіту.
+    Повертає список resolved/skipped-rows.
     """
     resolved: list[dict] = []
+    seen_labels: set[str] = set()  # guard від повторного процесингу того ж labels
+
     for i in range(max_iters):
         opened = await frame.evaluate(
             """
-            () => {
+            (alreadySeen) => {
                 const skipBtns = [...document.querySelectorAll('button')].filter(
                     b => /^\\s*skip\\s*$/i.test(b.innerText || '') && b.offsetParent
                 );
@@ -742,7 +749,7 @@ async def _frame_resolve_attribute_mappings(
                 const skip = skipBtns[0];
                 let row = skip.parentElement;
                 let input = null, chevron = null;
-                for (let lvl = 0; lvl < 8 && row; lvl++) {
+                for (let lvl = 0; lvl < 10 && row; lvl++) {
                     if (!input) input = row.querySelector('input:not([type=hidden])');
                     if (!chevron) {
                         const btns = [...row.querySelectorAll('button')]
@@ -753,26 +760,63 @@ async def _frame_resolve_attribute_mappings(
                             b.querySelector('svg')
                         ) || btns[btns.length - 1];
                     }
-                    if (input && chevron) break;
+                    if (input) break;
                     row = row.parentElement;
                 }
-                if (!chevron) return null;
+                if (!input) return null;
 
                 const rowText = (row?.innerText || '').split('\\n')[0].trim();
                 const label = rowText.replace(/\\*\\s*$/, '').trim();
-                const inputValue = input?.value || '';
+                const prefilled = input.value || '';
 
-                chevron.scrollIntoView({block: 'center'});
-                chevron.click();
-                return {label, inputValue};
+                if (alreadySeen.includes(label)) {
+                    return {label, prefilled, stuck: true};
+                }
+
+                input.scrollIntoView({block: 'center'});
+                input.focus();
+
+                // React-compatible value setter: clear, then type label
+                const setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                setter.call(input, '');
+                input.dispatchEvent(new Event('input', {bubbles: true}));
+                setter.call(input, label);
+                input.dispatchEvent(new Event('input', {bubbles: true}));
+                input.dispatchEvent(new Event('change', {bubbles: true}));
+
+                // Open dropdown via chevron-кнопку, якщо вона ще не відкрила
+                if (chevron) chevron.click();
+
+                return {label, prefilled};
             }
-            """
+            """,
+            list(seen_labels),
         )
         if not opened:
-            log.info("No more unresolved attribute mappings (resolved %d so far)", len(resolved))
+            log.info("No more unresolved attribute mappings (resolved %d)", len(resolved))
             break
 
-        await page.wait_for_timeout(500)
+        label = opened.get("label", "")
+        if opened.get("stuck"):
+            log.warning("Stuck row %r — Skip-кліком пропускаємо", label)
+            await frame.evaluate(
+                """
+                () => {
+                    const sb = [...document.querySelectorAll('button')].find(
+                        b => /^\\s*skip\\s*$/i.test(b.innerText || '') && b.offsetParent
+                    );
+                    if (sb) sb.click();
+                }
+                """
+            )
+            await page.wait_for_timeout(400)
+            resolved.append({"source": label, "skipped": "stuck"})
+            continue
+
+        seen_labels.add(label)
+        await page.wait_for_timeout(800)  # дати VTEX-у час на рендер опцій
 
         result = await frame.evaluate(
             """
@@ -815,24 +859,40 @@ async def _frame_resolve_attribute_mappings(
             }
             """,
             [
-                [opened.get("label", ""), opened.get("inputValue", "")],
+                [label, opened.get("prefilled", "")],
                 NEUTRAL_ATTRIBUTE_FALLBACKS,
             ],
         )
+
+        if result.get("error") == "no_options":
+            log.warning("No options for %r — Skip-кліком", label)
+            await frame.evaluate(
+                """
+                () => {
+                    const sb = [...document.querySelectorAll('button')].find(
+                        b => /^\\s*skip\\s*$/i.test(b.innerText || '') && b.offsetParent
+                    );
+                    if (sb) sb.click();
+                }
+                """
+            )
+            await page.wait_for_timeout(400)
+            resolved.append({"source": label, "skipped": "no_options"})
+            continue
 
         await page.wait_for_timeout(500)
         log.info(
             "Resolve #%d: source=%r prefill=%r → picked=%r (%s, %d opts)",
             i + 1,
-            opened.get("label"),
-            opened.get("inputValue"),
+            label,
+            opened.get("prefilled"),
             result.get("picked"),
             result.get("reason"),
             result.get("total_options") or 0,
         )
         resolved.append({
-            "source": opened.get("label"),
-            "prefill": opened.get("inputValue"),
+            "source": label,
+            "prefill": opened.get("prefilled"),
             "picked": result.get("picked"),
             "reason": result.get("reason"),
             "available": result.get("available"),
