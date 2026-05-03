@@ -330,17 +330,24 @@ async def upload_xlsx_to_obi(
     # поки processing завершиться і Weiter стане enabled.
     await page.wait_for_timeout(2500)
     screenshots.append(await _shot(page, "10_step3_review"))
-    log.info("Waiting for Schritt 3 processing to finish...")
+    log.info("Waiting for Schritt 3 dictionary rows to render...")
 
-    # ── 9a. Resolve dictionary-mapping dropdowns (Schritt 3 attribute values) ─
-    # Якщо unmapped values з'явилися лише на Schritt 3 review — обробляємо тут.
-    try:
-        resolved_step3 = await _frame_resolve_attribute_mappings(app_frame, page)
-        if resolved_step3:
-            log.info("Schritt 3 resolved %d dictionary mappings", len(resolved_step3))
-            screenshots.append(await _shot(page, "10b_dict_resolved_step3"))
-    except Exception:
-        log.exception("Schritt 3 dictionary resolve failed (non-fatal)")
+    # ── 9a. Wait for Skip rows to appear OR for Weiter to be enabled ────────
+    # VTEX парсить xlsx 30-60с і ЛИШЕ ПОТІМ рендерить mandatory-rows з Skip
+    # кнопкою. Без цього ожидания resolve викликається до появи рядків.
+    schritt3_state = await _wait_for_skip_or_weiter(app_frame, page, timeout_s=180)
+    log.info("Schritt 3 wait result: %s", schritt3_state)
+    screenshots.append(await _shot(page, f"10a_schritt3_state_{schritt3_state}"))
+
+    # ── 9b. Resolve dictionary-mapping dropdowns (Schritt 3 attribute values) ─
+    if schritt3_state == "skip":
+        try:
+            resolved_step3 = await _frame_resolve_attribute_mappings(app_frame, page)
+            if resolved_step3:
+                log.info("Schritt 3 resolved %d dictionary mappings", len(resolved_step3))
+                screenshots.append(await _shot(page, "10b_dict_resolved_step3"))
+        except Exception:
+            log.exception("Schritt 3 dictionary resolve failed (non-fatal)")
 
     # ── 9b. Weiter → Step 4 (start import) ─────────────────────────────────
     # Чекаємо до 90с щоб Schritt 3 review/processing завершився
@@ -711,6 +718,54 @@ async def _frame_add_sku_images_multiselect(frame: Frame, page: Page, col_names:
         await page.keyboard.press("Escape")
     except Exception:
         pass
+
+
+async def _wait_for_skip_or_weiter(
+    frame: Frame, page: Page, timeout_s: int = 180
+) -> str:
+    """Polling до появи Skip-кнопки (=mandatory dictionary mapping) АБО до
+    enabled Weiter-кнопки (=сторінка готова, mappings не потрібні).
+
+    Без цього wait resolve_attribute_mappings викликається до того як VTEX
+    закінчить обробку xlsx (Schritt 3 backend processing 30-60+ сек) і не
+    знаходить жодного рядка для резолву.
+
+    Повертає:
+      "skip" — є unresolved mandatory-rows, треба їх обробити
+      "weiter" — Weiter активний, можна йти далі
+      "timeout" — нічого не з'явилось
+    """
+    elapsed = 0.0
+    while elapsed < timeout_s:
+        try:
+            state = await frame.evaluate(
+                """
+                () => {
+                    const skipBtns = [...document.querySelectorAll('button')].filter(
+                        b => /^\\s*skip\\s*$/i.test(b.innerText || '') && b.offsetParent
+                    );
+                    const weiterBtns = [...document.querySelectorAll('button')].filter(
+                        b => /weiter/i.test(b.innerText || '') && b.offsetParent
+                    );
+                    const weiter = weiterBtns.find(
+                        b => !b.disabled && b.getAttribute('aria-disabled') !== 'true'
+                    );
+                    return {
+                        skip_count: skipBtns.length,
+                        weiter_enabled: !!weiter,
+                    };
+                }
+                """
+            )
+        except Exception:
+            state = {}
+        if state.get("skip_count", 0) > 0:
+            return "skip"
+        if state.get("weiter_enabled"):
+            return "weiter"
+        await page.wait_for_timeout(2000)
+        elapsed += 2.0
+    return "timeout"
 
 
 async def _click_first_skip(frame: Frame) -> None:
