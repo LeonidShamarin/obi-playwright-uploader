@@ -340,7 +340,7 @@ async def upload_xlsx_to_obi(
     screenshots.append(await _shot(page, f"10a_schritt3_state_{schritt3_state}"))
 
     # ── 9b. Resolve dictionary-mapping dropdowns (Schritt 3 attribute values) ─
-    if schritt3_state == "skip":
+    if schritt3_state == "mandatory":
         try:
             resolved_step3 = await _frame_resolve_attribute_mappings(app_frame, page)
             if resolved_step3:
@@ -723,17 +723,19 @@ async def _frame_add_sku_images_multiselect(frame: Frame, page: Page, col_names:
 async def _wait_for_skip_or_weiter(
     frame: Frame, page: Page, timeout_s: int = 180
 ) -> str:
-    """Polling до появи Skip-кнопки (=mandatory dictionary mapping) АБО до
-    enabled Weiter-кнопки (=сторінка готова, mappings не потрібні).
+    """Polling до появи "Mandatory" badge (=unresolved row) АБО enabled Weiter.
+
+    Schritt 3 розбитий на секції (Brand Name, weeeRelevant, color etc.).
+    Кожен рядок має постійну Skip-кнопку незалежно від статусу — discriminator
+    це badge праворуч: "Mandatory" (помаранч, unresolved) vs "Mapped" (зелений).
 
     Без цього wait resolve_attribute_mappings викликається до того як VTEX
-    закінчить обробку xlsx (Schritt 3 backend processing 30-60+ сек) і не
-    знаходить жодного рядка для резолву.
+    закінчить обробку xlsx (Schritt 3 backend processing 30-60+ сек).
 
     Повертає:
-      "skip" — є unresolved mandatory-rows, треба їх обробити
-      "weiter" — Weiter активний, можна йти далі
-      "timeout" — нічого не з'явилось
+      "mandatory" — є unresolved rows з Mandatory badge → треба їх обробити
+      "weiter"    — Weiter активний, mappings не потрібні
+      "timeout"   — нічого не з'явилось
     """
     elapsed = 0.0
     while elapsed < timeout_s:
@@ -741,8 +743,10 @@ async def _wait_for_skip_or_weiter(
             state = await frame.evaluate(
                 """
                 () => {
-                    const skipBtns = [...document.querySelectorAll('button')].filter(
-                        b => /^\\s*skip\\s*$/i.test(b.innerText || '') && b.offsetParent
+                    const mandatory = [...document.querySelectorAll('*')].filter(
+                        el => el.children.length === 0
+                          && /^\\s*Mandatory\\s*$/.test(el.innerText || '')
+                          && el.offsetParent
                     );
                     const weiterBtns = [...document.querySelectorAll('button')].filter(
                         b => /weiter/i.test(b.innerText || '') && b.offsetParent
@@ -751,7 +755,7 @@ async def _wait_for_skip_or_weiter(
                         b => !b.disabled && b.getAttribute('aria-disabled') !== 'true'
                     );
                     return {
-                        skip_count: skipBtns.length,
+                        mandatory_count: mandatory.length,
                         weiter_enabled: !!weiter,
                     };
                 }
@@ -759,8 +763,8 @@ async def _wait_for_skip_or_weiter(
             )
         except Exception:
             state = {}
-        if state.get("skip_count", 0) > 0:
-            return "skip"
+        if state.get("mandatory_count", 0) > 0:
+            return "mandatory"
         if state.get("weiter_enabled"):
             return "weiter"
         await page.wait_for_timeout(2000)
@@ -806,34 +810,41 @@ async def _frame_resolve_attribute_mappings(
     resolved: list[dict] = []
     seen_labels: set[str] = set()
 
-    for i in range(max_iters):
-        # Step 1: Read label of next unresolved row
-        info = await frame.evaluate(
-            """
-            (alreadySeen) => {
-                const skipBtns = [...document.querySelectorAll('button')].filter(
-                    b => /^\\s*skip\\s*$/i.test(b.innerText || '') && b.offsetParent
-                );
-                if (!skipBtns.length) return null;
-                const skip = skipBtns[0];
-                let row = skip.parentElement;
-                let input = null;
-                for (let lvl = 0; lvl < 10 && row; lvl++) {
-                    if (!input) input = row.querySelector('input:not([type=hidden])');
-                    if (input) break;
-                    row = row.parentElement;
-                }
-                if (!input) return null;
-                const rowText = (row?.innerText || '').split('\\n')[0].trim();
-                const label = rowText.replace(/\\*\\s*$/, '').trim();
-                if (alreadySeen.includes(label)) return {label, stuck: true};
-                return {label, prefilled: input.value || ''};
+    # JS-helper для пошуку рядка з "Mandatory" badge
+    find_mandatory_row_js = """
+        (alreadySeen) => {
+            const mandatoryBadges = [...document.querySelectorAll('*')].filter(
+                el => el.children.length === 0
+                  && /^\\s*Mandatory\\s*$/.test(el.innerText || '')
+                  && el.offsetParent
+            );
+            if (!mandatoryBadges.length) return null;
+            // Беремо ПЕРШИЙ Mandatory badge → walk up до row containing input
+            const badge = mandatoryBadges[0];
+            let row = badge.parentElement;
+            let input = null;
+            for (let lvl = 0; lvl < 12 && row; lvl++) {
+                input = row.querySelector('input:not([type=hidden])');
+                if (input) break;
+                row = row.parentElement;
             }
-            """,
-            list(seen_labels),
-        )
+            if (!input || !row) return null;
+            // Label — це перший текст у рядку (e.g. "Magenta*" або "transparent*")
+            const rowText = (row.innerText || '').split('\\n')[0].trim();
+            const label = rowText.replace(/\\*\\s*$/, '').trim();
+            return {
+                label,
+                prefilled: input.value || '',
+                stuck: alreadySeen.includes(label),
+            };
+        }
+    """
+
+    for i in range(max_iters):
+        # Step 1: Read label of next "Mandatory" row
+        info = await frame.evaluate(find_mandatory_row_js, list(seen_labels))
         if not info:
-            log.info("No more unresolved attribute mappings (resolved %d)", len(resolved))
+            log.info("No more Mandatory rows (resolved %d)", len(resolved))
             break
 
         label = info.get("label", "")
@@ -844,19 +855,21 @@ async def _frame_resolve_attribute_mappings(
             resolved.append({"source": label, "skipped": "stuck"})
             continue
 
-        # Step 2: Get the input ElementHandle (so we can use Playwright's real fill)
+        # Step 2: Get the input ElementHandle of the Mandatory row
         handle = await frame.evaluate_handle(
             """
             () => {
-                const skipBtns = [...document.querySelectorAll('button')].filter(
-                    b => /^\\s*skip\\s*$/i.test(b.innerText || '') && b.offsetParent
+                const mandatoryBadges = [...document.querySelectorAll('*')].filter(
+                    el => el.children.length === 0
+                      && /^\\s*Mandatory\\s*$/.test(el.innerText || '')
+                      && el.offsetParent
                 );
-                if (!skipBtns.length) return null;
-                const skip = skipBtns[0];
-                let row = skip.parentElement;
+                if (!mandatoryBadges.length) return null;
+                const badge = mandatoryBadges[0];
+                let row = badge.parentElement;
                 let input = null;
-                for (let lvl = 0; lvl < 10 && row; lvl++) {
-                    if (!input) input = row.querySelector('input:not([type=hidden])');
+                for (let lvl = 0; lvl < 12 && row; lvl++) {
+                    input = row.querySelector('input:not([type=hidden])');
                     if (input) break;
                     row = row.parentElement;
                 }
