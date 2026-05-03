@@ -1015,93 +1015,133 @@ async def _frame_resolve_attribute_mappings(
             resolved.append({"source": label, "skipped": f"fill_failed:{type(e).__name__}"})
             continue
 
-        await page.wait_for_timeout(900)  # дати VTEX час на рендер опцій
+        # Wait for react-select options to render in DOM
+        try:
+            await frame.locator('[role="option"]').first.wait_for(
+                state="visible", timeout=4000
+            )
+        except Exception:
+            log.warning("No [role=option] visible after typing %r — waiting more", label)
+            await page.wait_for_timeout(1500)
 
-        # Step 4: Pick option — БАГАТОЕТАПНА стратегія, бо VTEX-React DOM
-        # неоднорідний. ЗАВЖДИ обираємо щось з dropdown (Skip = імпорт впаде).
+        # Step 4: Pick option — react-select REQUIRES mousedown event
+        # (option's onClick handler bound to mousedown, not click — стандартний
+        # quirk react-select). Звичайний el.click() може не спрацювати через
+        # input blur race. Alternativa: keyboard ArrowDown + Enter.
         candidates = [label] + NEUTRAL_ATTRIBUTE_FALLBACKS
         picked = None
         pick_method = None
 
-        # Method 1: get_by_role("option", name=...) — semantic ARIA
+        # Method 1: react-select mousedown event (правильний для exact match)
         for cand in candidates:
             if picked or not cand:
                 continue
             try:
                 pat = re.compile(r"^\s*" + re.escape(cand) + r"\s*$", re.I)
-                opt = frame.get_by_role("option", name=pat)
+                opt = frame.locator('[role="option"]').filter(has_text=pat)
                 cnt = await opt.count()
                 for idx in range(min(cnt, 5)):
                     el = opt.nth(idx)
                     try:
                         if not await el.is_visible(timeout=300):
                             continue
-                        await el.click(timeout=2000)
+                        await el.scroll_into_view_if_needed(timeout=1000)
+                        # react-select selects on MOUSEDOWN
+                        await el.dispatch_event("mousedown")
+                        await page.wait_for_timeout(50)
+                        await el.dispatch_event("mouseup")
+                        await el.dispatch_event("click")
                         picked = cand
-                        pick_method = "role=option"
+                        pick_method = "mousedown"
                         break
                     except Exception as exc:
-                        log.debug("role=option click %r failed: %s", cand, exc)
+                        log.debug("mousedown %r failed: %s", cand, exc)
                         continue
             except Exception:
                 continue
 
-        # Method 2: get_by_text exact — by visible text content
+        # Method 2: keyboard navigation — ArrowDown N times + Enter
+        # (react-select highlights first option, navigate to exact match)
+        if not picked:
+            for cand in candidates:
+                if picked or not cand:
+                    continue
+                try:
+                    # Get all visible option texts
+                    opts_loc = frame.locator('[role="option"]')
+                    opt_count = await opts_loc.count()
+                    target_idx = None
+                    for i in range(min(opt_count, 30)):
+                        t = (await opts_loc.nth(i).inner_text() or "").strip()
+                        if t.lower() == cand.lower():
+                            target_idx = i
+                            break
+                    if target_idx is None:
+                        continue
+                    # Navigate via keyboard (input still focused after fill)
+                    for _ in range(target_idx):
+                        await page.keyboard.press("ArrowDown")
+                        await page.wait_for_timeout(50)
+                    await page.keyboard.press("Enter")
+                    picked = cand
+                    pick_method = f"keyboard:arrows{target_idx}+enter"
+                    break
+                except Exception as exc:
+                    log.debug("keyboard nav %r failed: %s", cand, exc)
+                    continue
+
+        # Method 3: el.click() — last attempt
         if not picked:
             for cand in candidates:
                 if picked or not cand:
                     continue
                 try:
                     pat = re.compile(r"^\s*" + re.escape(cand) + r"\s*$", re.I)
-                    opt = frame.get_by_text(pat)
+                    opt = frame.locator('[role="option"]').filter(has_text=pat)
                     cnt = await opt.count()
-                    for idx in range(min(cnt, 8)):
+                    for idx in range(min(cnt, 5)):
                         el = opt.nth(idx)
                         try:
                             if not await el.is_visible(timeout=300):
                                 continue
-                            await el.click(timeout=2000)
+                            await el.click(force=True, timeout=2000)
                             picked = cand
-                            pick_method = "text"
+                            pick_method = "force_click"
                             break
-                        except Exception as exc:
-                            log.debug("text click %r idx %d failed: %s", cand, idx, exc)
+                        except Exception:
                             continue
                 except Exception:
                     continue
 
-        # Method 3: ANY visible dropdown option (last resort — pick first
-        # available щоб не Skip-нути; може бути неточний колір але імпорт пройде)
+        # Method 4: ПЕРША видима опція (мабуть неточна, але краще за Skip)
         if not picked:
             res = await frame.evaluate(
                 """
                 () => {
-                    const opts = [...document.querySelectorAll(
-                        '[role="option"], [role="menuitem"], li, [class*="option" i], [class*="DropdownItem" i]'
-                    )].filter(e => {
-                        if (!e.offsetParent) return false;
-                        const t = (e.innerText || '').trim();
-                        return t.length > 0 && t.length < 80;
-                    });
+                    const opts = [...document.querySelectorAll('[role="option"]')].filter(
+                        e => e.offsetParent && (e.innerText || '').trim()
+                    );
                     if (!opts.length) return null;
-                    opts[0].scrollIntoView({block: 'center'});
-                    opts[0].click();
-                    return (opts[0].innerText || '').trim();
+                    const first = opts[0];
+                    first.scrollIntoView({block: 'center'});
+                    // react-select friendly events
+                    first.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, button: 0}));
+                    first.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, button: 0}));
+                    first.dispatchEvent(new MouseEvent('click', {bubbles: true, button: 0}));
+                    return (first.innerText || '').trim();
                 }
                 """
             )
             if res:
                 picked = res
-                pick_method = "first_visible"
-                log.warning("Picked first available option %r for label %r (no exact match)", res, label)
+                pick_method = "first_mousedown"
+                log.warning("Picked first option %r for %r (no exact)", res, label)
 
-        # ОСТАННЯ резерв — Skip-клік (user popередив що це зламає import,
-        # але якщо ми тут то dropdown зовсім порожній — все одно зламається)
         if not picked:
-            log.error("CRITICAL: No options at all for %r — Skip (import will likely fail)", label)
-            await _click_first_skip(frame)
-            await page.wait_for_timeout(500)
+            log.error("CRITICAL: No options at all for %r — leaving unresolved", label)
             resolved.append({"source": label, "skipped": "no_dropdown_options"})
+            # NB: НЕ клікаємо Skip — user попередив що це зламає import.
+            # Краще лишити Mandatory і зловити error на Schritt 4.
             continue
 
         log.info("Resolve %r → %r via %s", label, picked, pick_method)
