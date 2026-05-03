@@ -33,6 +33,20 @@ SKU_IMAGE_COLUMNS_TO_MAP = [f"SKU Images {i}" for i in range(3, 11)]
 STATUS_POLL_INTERVAL = 10
 STATUS_POLL_MAX_TRIES = 90  # 15 хв
 
+# Fallback values для dictionary-mapping dropdowns (Schritt 2/3) коли source-value
+# не має exact-match у списку OBI canonical-options. Підбираються по черзі —
+# перший наявний у dropdown буде обрано. Останній резерв — перша опція в списку.
+NEUTRAL_ATTRIBUTE_FALLBACKS = [
+    "Sonstige",
+    "Sonstiges",
+    "Mehrfarbig",
+    "Neutral",
+    "Standard",
+    "Andere",
+    "Farblos",
+    "Universal",
+]
+
 
 async def upload_xlsx_to_obi(
     page: Page, xlsx_bytes: bytes, jobname: str, category: str | None = None,
@@ -296,6 +310,14 @@ async def upload_xlsx_to_obi(
     await _frame_add_sku_images_multiselect(app_frame, page, SKU_IMAGE_COLUMNS_TO_MAP)
     screenshots.append(await _shot(page, "09_mapping_done"))
 
+    # ── 8b. Resolve dictionary-mapping dropdowns (Schritt 2 attribute values) ─
+    # VTEX може показати тут "X*" поля з Skip + dropdown — це attribute values
+    # які не змаплені автоматично (напр. Color "Magenta" → Magenta/Grün-Magenta).
+    resolved_step2 = await _frame_resolve_attribute_mappings(app_frame, page)
+    if resolved_step2:
+        log.info("Schritt 2 resolved %d dictionary mappings", len(resolved_step2))
+        screenshots.append(await _shot(page, "09b_dict_resolved_step2"))
+
     # ── 9. Weiter → Step 3 ──────────────────────────────────────────────────
     next2 = await _wait_and_click(app_frame, page, "weiter", timeout_s=20)
     if next2:
@@ -309,6 +331,16 @@ async def upload_xlsx_to_obi(
     await page.wait_for_timeout(2500)
     screenshots.append(await _shot(page, "10_step3_review"))
     log.info("Waiting for Schritt 3 processing to finish...")
+
+    # ── 9a. Resolve dictionary-mapping dropdowns (Schritt 3 attribute values) ─
+    # Якщо unmapped values з'явилися лише на Schritt 3 review — обробляємо тут.
+    try:
+        resolved_step3 = await _frame_resolve_attribute_mappings(app_frame, page)
+        if resolved_step3:
+            log.info("Schritt 3 resolved %d dictionary mappings", len(resolved_step3))
+            screenshots.append(await _shot(page, "10b_dict_resolved_step3"))
+    except Exception:
+        log.exception("Schritt 3 dictionary resolve failed (non-fatal)")
 
     # ── 9b. Weiter → Step 4 (start import) ─────────────────────────────────
     # Чекаємо до 90с щоб Schritt 3 review/processing завершився
@@ -679,6 +711,134 @@ async def _frame_add_sku_images_multiselect(frame: Frame, page: Page, col_names:
         await page.keyboard.press("Escape")
     except Exception:
         pass
+
+
+async def _frame_resolve_attribute_mappings(
+    frame: Frame, page: Page, max_iters: int = 80
+) -> list[dict]:
+    """Авто-резолв dictionary-mapping dropdowns на Schritt 2/3.
+
+    UI patterns: рядок з "<Label>*" + input (pre-filled з best-guess) +
+    "Skip" button + chevron-кнопкою для відкриття dropdown.
+
+    Стратегія per row:
+      1. Click chevron → dropdown відкривається з canonical-options
+      2. Pick exact-match (case-insensitive) до label OR input value
+      3. Else pick перший наявний з NEUTRAL_ATTRIBUTE_FALLBACKS
+      4. Else fallback на першу опцію (VTEX-pre-sorted by relevance)
+
+    Повертає список resolved-rows для логу/звіту.
+    """
+    resolved: list[dict] = []
+    for i in range(max_iters):
+        opened = await frame.evaluate(
+            """
+            () => {
+                const skipBtns = [...document.querySelectorAll('button')].filter(
+                    b => /^\\s*skip\\s*$/i.test(b.innerText || '') && b.offsetParent
+                );
+                if (!skipBtns.length) return null;
+
+                const skip = skipBtns[0];
+                let row = skip.parentElement;
+                let input = null, chevron = null;
+                for (let lvl = 0; lvl < 8 && row; lvl++) {
+                    if (!input) input = row.querySelector('input:not([type=hidden])');
+                    if (!chevron) {
+                        const btns = [...row.querySelectorAll('button')]
+                            .filter(b => b !== skip && b.offsetParent);
+                        chevron = btns.find(b =>
+                            b.getAttribute('aria-haspopup') ||
+                            b.getAttribute('aria-expanded') !== null ||
+                            b.querySelector('svg')
+                        ) || btns[btns.length - 1];
+                    }
+                    if (input && chevron) break;
+                    row = row.parentElement;
+                }
+                if (!chevron) return null;
+
+                const rowText = (row?.innerText || '').split('\\n')[0].trim();
+                const label = rowText.replace(/\\*\\s*$/, '').trim();
+                const inputValue = input?.value || '';
+
+                chevron.scrollIntoView({block: 'center'});
+                chevron.click();
+                return {label, inputValue};
+            }
+            """
+        )
+        if not opened:
+            log.info("No more unresolved attribute mappings (resolved %d so far)", len(resolved))
+            break
+
+        await page.wait_for_timeout(500)
+
+        result = await frame.evaluate(
+            """
+            ([preferred, neutralOptions]) => {
+                const opts = [...document.querySelectorAll(
+                    '[role="option"], [role="menuitem"], li[data-value], li.vtex-dropdown__option'
+                )].filter(e => {
+                    if (!e.offsetParent) return false;
+                    const t = (e.innerText || '').trim();
+                    return t.length > 0 && t.length < 120;
+                });
+                if (!opts.length) return {error: 'no_options'};
+
+                const norm = s => (s || '').trim().toLowerCase();
+                const optTexts = opts.map(o => (o.innerText || '').trim());
+
+                let pick = null;
+                let pickReason = 'first';
+                for (const p of preferred) {
+                    if (!p) continue;
+                    pick = opts.find(o => norm(o.innerText) === norm(p));
+                    if (pick) { pickReason = 'exact:' + p; break; }
+                }
+                if (!pick) {
+                    for (const n of neutralOptions) {
+                        pick = opts.find(o => norm(o.innerText) === norm(n));
+                        if (pick) { pickReason = 'neutral:' + n; break; }
+                    }
+                }
+                if (!pick) pick = opts[0];
+
+                pick.scrollIntoView({block: 'center'});
+                pick.click();
+                return {
+                    picked: (pick.innerText || '').trim(),
+                    reason: pickReason,
+                    available: optTexts.slice(0, 30),
+                    total_options: opts.length,
+                };
+            }
+            """,
+            [
+                [opened.get("label", ""), opened.get("inputValue", "")],
+                NEUTRAL_ATTRIBUTE_FALLBACKS,
+            ],
+        )
+
+        await page.wait_for_timeout(500)
+        log.info(
+            "Resolve #%d: source=%r prefill=%r → picked=%r (%s, %d opts)",
+            i + 1,
+            opened.get("label"),
+            opened.get("inputValue"),
+            result.get("picked"),
+            result.get("reason"),
+            result.get("total_options") or 0,
+        )
+        resolved.append({
+            "source": opened.get("label"),
+            "prefill": opened.get("inputValue"),
+            "picked": result.get("picked"),
+            "reason": result.get("reason"),
+            "available": result.get("available"),
+        })
+
+    return resolved
 
 
 async def _frame_add_sku_image_mapping(frame: Frame, col_name: str):
