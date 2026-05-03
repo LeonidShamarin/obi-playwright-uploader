@@ -339,15 +339,79 @@ async def upload_xlsx_to_obi(
     log.info("Schritt 3 wait result: %s", schritt3_state)
     screenshots.append(await _shot(page, f"10a_schritt3_state_{schritt3_state}"))
 
-    # ── 9b. Resolve dictionary-mapping dropdowns (Schritt 3 attribute values) ─
+    # ── 9b. Expand all collapsed sections (щоб Mandatory rows стали visible) ─
+    expanded = await _expand_all_sections(app_frame, page)
+    log.info("Expanded %d collapsed sections", expanded)
+    if expanded:
+        await page.wait_for_timeout(2000)
+        screenshots.append(await _shot(page, "10a2_after_expand"))
+
+    # Re-check для Mandatory після expand
+    if schritt3_state != "mandatory":
+        post_check = await _wait_for_skip_or_weiter(app_frame, page, timeout_s=15)
+        log.info("After expand schritt3_state=%s", post_check)
+        if post_check == "mandatory":
+            schritt3_state = "mandatory"
+
+    # ── 9c. Resolve dictionary-mapping dropdowns (Schritt 3 attribute values) ─
     if schritt3_state == "mandatory":
         try:
             resolved_step3 = await _frame_resolve_attribute_mappings(app_frame, page)
+            log.info("Schritt 3 resolve attempted %d rows", len(resolved_step3))
             if resolved_step3:
-                log.info("Schritt 3 resolved %d dictionary mappings", len(resolved_step3))
                 screenshots.append(await _shot(page, "10b_dict_resolved_step3"))
         except Exception:
             log.exception("Schritt 3 dictionary resolve failed (non-fatal)")
+
+    # ── 9d. Fallback: Skip-click any remaining Mandatory rows ───────────────
+    # Якщо після resolve залишились Mandatory (наприклад dropdown не відкрився
+    # для якогось рядка) — клікаємо Skip щоб Weiter міг активуватись.
+    skipped_count = 0
+    for _ in range(50):
+        remaining = await app_frame.evaluate(
+            """
+            () => [...document.querySelectorAll('*')].filter(
+                el => el.children.length === 0
+                  && /^\\s*Mandatory\\s*$/.test(el.innerText || '')
+                  && el.offsetParent
+            ).length
+            """
+        )
+        if remaining == 0:
+            break
+        clicked = await app_frame.evaluate(
+            """
+            () => {
+                const mandatory = [...document.querySelectorAll('*')].find(
+                    el => el.children.length === 0
+                      && /^\\s*Mandatory\\s*$/.test(el.innerText || '')
+                      && el.offsetParent
+                );
+                if (!mandatory) return false;
+                let row = mandatory.parentElement;
+                for (let lvl = 0; lvl < 12 && row; lvl++) {
+                    const skipBtn = [...row.querySelectorAll('button')].find(
+                        b => /^\\s*skip\\s*$/i.test(b.innerText || '') && b.offsetParent
+                    );
+                    if (skipBtn) {
+                        skipBtn.scrollIntoView({block: 'center'});
+                        skipBtn.click();
+                        return true;
+                    }
+                    row = row.parentElement;
+                }
+                return false;
+            }
+            """
+        )
+        if not clicked:
+            log.warning("No Skip button on remaining Mandatory row #%d", skipped_count + 1)
+            break
+        skipped_count += 1
+        await page.wait_for_timeout(400)
+    if skipped_count:
+        log.info("Skip-clicked %d remaining Mandatory rows as fallback", skipped_count)
+        screenshots.append(await _shot(page, "10c_skip_fallback"))
 
     # ── 9b. Weiter → Step 4 (start import) ─────────────────────────────────
     # Чекаємо до 90с щоб Schritt 3 review/processing завершився
@@ -718,6 +782,57 @@ async def _frame_add_sku_images_multiselect(frame: Frame, page: Page, col_names:
         await page.keyboard.press("Escape")
     except Exception:
         pass
+
+
+async def _expand_all_sections(frame: Frame, page: Page, max_attempts: int = 3) -> int:
+    """Розгорнути всі згорнуті attribute-секції на Schritt 3.
+
+    VTEX рендерить Schritt 3 з секціями типу "Brand Name 2 of 2 mapped".
+    Більшість секцій згорнуті за замовчуванням; Mandatory rows усередині них
+    мають offsetParent=null → JS-query їх не бачить.
+
+    Стратегія: знайти кнопки/елементи з aria-expanded="false" АБО з текстом
+    "X of Y mapped" і клікнути їх. Повторити кілька раз — після кожного клика
+    можуть з'явитись нові вкладені секції.
+    """
+    total_expanded = 0
+    for attempt in range(max_attempts):
+        expanded = await frame.evaluate(
+            """
+            () => {
+                let candidates = [...document.querySelectorAll('[aria-expanded="false"]')]
+                    .filter(el => el.offsetParent);
+                if (!candidates.length) {
+                    // Fallback: section headers за текстом "X of Y mapped"
+                    const all = [...document.querySelectorAll('button, [role="button"], div')];
+                    candidates = all.filter(el => {
+                        if (!el.offsetParent || el.children.length > 80) return false;
+                        const t = (el.innerText || '').trim();
+                        return /\\d+\\s+of\\s+\\d+\\s+mapped/i.test(t) && t.length < 250;
+                    });
+                    // Тільки deepest (не containing інші candidates)
+                    candidates = candidates.filter(c =>
+                        !candidates.some(o => o !== c && c.contains(o))
+                    );
+                }
+                let count = 0;
+                for (const el of candidates) {
+                    try {
+                        el.scrollIntoView({block: 'center'});
+                        el.click();
+                        count++;
+                    } catch (e) {}
+                }
+                return count;
+            }
+            """
+        )
+        log.info("Expand attempt %d: clicked %d section headers", attempt + 1, expanded)
+        total_expanded += expanded
+        if expanded == 0:
+            break
+        await page.wait_for_timeout(1500)
+    return total_expanded
 
 
 async def _wait_for_skip_or_weiter(
