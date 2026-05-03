@@ -1017,39 +1017,94 @@ async def _frame_resolve_attribute_mappings(
 
         await page.wait_for_timeout(900)  # дати VTEX час на рендер опцій
 
-        # Step 4: Click matching option via Playwright text-locator (case-insensitive)
+        # Step 4: Pick option — БАГАТОЕТАПНА стратегія, бо VTEX-React DOM
+        # неоднорідний. ЗАВЖДИ обираємо щось з dropdown (Skip = імпорт впаде).
         candidates = [label] + NEUTRAL_ATTRIBUTE_FALLBACKS
         picked = None
+        pick_method = None
+
+        # Method 1: get_by_role("option", name=...) — semantic ARIA
         for cand in candidates:
-            if not cand:
+            if picked or not cand:
                 continue
             try:
                 pat = re.compile(r"^\s*" + re.escape(cand) + r"\s*$", re.I)
-                opt = frame.get_by_text(pat)
+                opt = frame.get_by_role("option", name=pat)
                 cnt = await opt.count()
-                for idx in range(min(cnt, 8)):
+                for idx in range(min(cnt, 5)):
                     el = opt.nth(idx)
                     try:
                         if not await el.is_visible(timeout=300):
                             continue
-                        # Avoid clicking the row label itself — must be inside dropdown
-                        # (heuristic: option text usually appears in <li>/<div role=option>)
                         await el.click(timeout=2000)
                         picked = cand
+                        pick_method = "role=option"
                         break
-                    except Exception:
+                    except Exception as exc:
+                        log.debug("role=option click %r failed: %s", cand, exc)
                         continue
-                if picked:
-                    break
             except Exception:
                 continue
 
+        # Method 2: get_by_text exact — by visible text content
         if not picked:
-            log.warning("No option matching %r — Skip", label)
+            for cand in candidates:
+                if picked or not cand:
+                    continue
+                try:
+                    pat = re.compile(r"^\s*" + re.escape(cand) + r"\s*$", re.I)
+                    opt = frame.get_by_text(pat)
+                    cnt = await opt.count()
+                    for idx in range(min(cnt, 8)):
+                        el = opt.nth(idx)
+                        try:
+                            if not await el.is_visible(timeout=300):
+                                continue
+                            await el.click(timeout=2000)
+                            picked = cand
+                            pick_method = "text"
+                            break
+                        except Exception as exc:
+                            log.debug("text click %r idx %d failed: %s", cand, idx, exc)
+                            continue
+                except Exception:
+                    continue
+
+        # Method 3: ANY visible dropdown option (last resort — pick first
+        # available щоб не Skip-нути; може бути неточний колір але імпорт пройде)
+        if not picked:
+            res = await frame.evaluate(
+                """
+                () => {
+                    const opts = [...document.querySelectorAll(
+                        '[role="option"], [role="menuitem"], li, [class*="option" i], [class*="DropdownItem" i]'
+                    )].filter(e => {
+                        if (!e.offsetParent) return false;
+                        const t = (e.innerText || '').trim();
+                        return t.length > 0 && t.length < 80;
+                    });
+                    if (!opts.length) return null;
+                    opts[0].scrollIntoView({block: 'center'});
+                    opts[0].click();
+                    return (opts[0].innerText || '').trim();
+                }
+                """
+            )
+            if res:
+                picked = res
+                pick_method = "first_visible"
+                log.warning("Picked first available option %r for label %r (no exact match)", res, label)
+
+        # ОСТАННЯ резерв — Skip-клік (user popередив що це зламає import,
+        # але якщо ми тут то dropdown зовсім порожній — все одно зламається)
+        if not picked:
+            log.error("CRITICAL: No options at all for %r — Skip (import will likely fail)", label)
             await _click_first_skip(frame)
             await page.wait_for_timeout(500)
-            resolved.append({"source": label, "skipped": "no_option_match"})
+            resolved.append({"source": label, "skipped": "no_dropdown_options"})
             continue
+
+        log.info("Resolve %r → %r via %s", label, picked, pick_method)
 
         await page.wait_for_timeout(500)
         log.info(
